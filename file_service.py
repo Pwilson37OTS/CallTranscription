@@ -1,0 +1,75 @@
+import shutil
+import subprocess
+from datetime import datetime
+from pathlib import Path
+from typing import Dict, Any
+
+import streamlit as st
+
+from config import UPLOAD_DIR, CONVERTED_DIR, SUPPORTED_AUDIO_EXTENSIONS, MAX_UPLOAD_SIZE_MB
+
+
+@st.cache_data(ttl=60)
+def ffmpeg_available() -> bool:
+    return shutil.which("ffmpeg") is not None
+
+
+def convert_audio_to_wav(input_path: Path) -> Path:
+    if not ffmpeg_available():
+        raise RuntimeError(
+            "ffmpeg is not installed or not on PATH. Install ffmpeg first so the app can convert recordings to WAV automatically."
+        )
+
+    # Validate input path is within UPLOAD_DIR to prevent path traversal
+    resolved = input_path.resolve()
+    if not str(resolved).startswith(str(UPLOAD_DIR.resolve())):
+        raise ValueError("Invalid file path.")
+
+    output_path = CONVERTED_DIR / f"{input_path.stem}.wav"
+    command = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-ac", "1", "-ar", "16000",
+        str(output_path),
+    ]
+
+    result = subprocess.run(command, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        raise RuntimeError(f"ffmpeg conversion failed: {result.stderr}")
+
+    if not output_path.exists() or output_path.stat().st_size == 0:
+        raise RuntimeError("ffmpeg conversion failed: WAV file was not created.")
+
+    return output_path
+
+
+def save_uploaded_file(uploaded_file) -> Dict[str, Any]:
+    original_name = uploaded_file.name
+    ext = Path(original_name).suffix.lower()
+    if ext and ext not in SUPPORTED_AUDIO_EXTENSIONS:
+        st.warning(f"Unknown extension {ext}. Attempting conversion with ffmpeg anyway.")
+
+    file_bytes = uploaded_file.getbuffer()
+    file_size_mb = len(file_bytes) / (1024 * 1024)
+    if file_size_mb > MAX_UPLOAD_SIZE_MB:
+        raise ValueError(
+            f"File is too large ({file_size_mb:.1f} MB). Maximum allowed size is {MAX_UPLOAD_SIZE_MB} MB."
+        )
+
+    timestamp = datetime.utcnow().strftime("%Y%m%d_%H%M%S_%f")
+    safe_name = f"{timestamp}_{original_name}"
+    uploaded_destination = UPLOAD_DIR / safe_name
+
+    with open(uploaded_destination, "wb") as f:
+        f.write(file_bytes)
+
+    wav_path = convert_audio_to_wav(uploaded_destination)
+
+    # Store relative path from project root for portability
+    relative_path = wav_path.relative_to(Path(__file__).parent)
+
+    return {
+        "original_filename": original_name,
+        "stored_filename": wav_path.name,
+        "stored_path": str(relative_path),
+        "mime_type": "audio/wav",
+    }
