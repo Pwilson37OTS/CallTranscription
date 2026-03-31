@@ -1,9 +1,11 @@
+import os
+from collections import defaultdict
 from datetime import datetime
-from pathlib import Path
+from time import time
 
 import streamlit as st
 
-from config import APP_DIR, LOGO_PATH
+from config import LOGO_PATH, RATE_LIMIT_PER_HOUR
 from styles import APP_CSS
 from prompts import CALL_TYPE_CONFIG
 from db import (
@@ -17,6 +19,8 @@ from auth import (
     ensure_admin_exists, create_user,
 )
 from db import update_user
+from logging_config import logger
+from storage import storage
 
 # ============================================================
 # Recruiter Call Review Tool
@@ -24,18 +28,35 @@ from db import update_user
 # ============================================================
 
 st.set_page_config(page_title="Recruiter Call Review Tool", layout="wide")
+
+# --- Startup guard: require OpenAI API key ---
+if not os.getenv("OPENAI_API_KEY"):
+    st.error("**OPENAI_API_KEY** environment variable is not set. Add it to your `.env` file and restart.")
+    st.stop()
+
 st.markdown(APP_CSS, unsafe_allow_html=True)
 
 init_db()
 ensure_admin_exists()
 
 
-def resolve_audio_path(stored_path: str) -> Path:
-    """Resolve a stored path (relative or absolute) to an absolute path."""
-    p = Path(stored_path)
-    if p.is_absolute():
-        return p
-    return APP_DIR / p
+# --- Rate limiting (in-memory, per-user, per-hour) ---
+if "_rate_limits" not in st.session_state:
+    st.session_state._rate_limits = defaultdict(list)
+
+
+def _check_rate_limit(user_id: int) -> bool:
+    """Return True if the user is within the rate limit, False if exceeded."""
+    now = time()
+    window = st.session_state._rate_limits[user_id]
+    # Purge entries older than 1 hour
+    st.session_state._rate_limits[user_id] = [t for t in window if now - t < 3600]
+    return len(st.session_state._rate_limits[user_id]) < RATE_LIMIT_PER_HOUR
+
+
+def _record_api_call(user_id: int):
+    """Record an API call timestamp for rate limiting."""
+    st.session_state._rate_limits[user_id].append(time())
 
 
 # -----------------------------
@@ -61,8 +82,10 @@ def show_login_page():
                     user = authenticate(email, password)
                     if user:
                         login(user)
+                        logger.info("Login success: user_id=%d email=%s", user["id"], user["email"])
                         st.rerun()
                     else:
+                        logger.warning("Login failed: email=%s", email)
                         st.error("Invalid email or password, or account is deactivated.")
 
 
@@ -90,6 +113,7 @@ with st.sidebar:
     if user_is_admin:
         st.caption("Role: Admin")
     if st.button("Sign Out", use_container_width=True):
+        logger.info("Logout: user_id=%d", current_user_id)
         logout()
         st.rerun()
 
@@ -189,8 +213,10 @@ with upload_tab:
                         "user_id": current_user_id,
                     }
                     new_id = insert_call(record)
+                    logger.info("Upload: user_id=%d call_id=%d file=%s", current_user_id, new_id, file_info.get("original_filename", ""))
                     st.success(f"Recording saved. Call ID: {new_id}")
                 except Exception as e:
+                    logger.error("Upload failed: user_id=%d error=%s", current_user_id, e)
                     st.error(f"Upload failed: {e}")
                     if not ffmpeg_available():
                         st.info(
@@ -285,7 +311,7 @@ with queue_tab:
                         st.success("Metadata saved.")
                         st.rerun()
 
-                audio_path = resolve_audio_path(call["stored_path"])
+                audio_path = storage.resolve(call["stored_path"])
 
                 with col_b:
                     if audio_path.exists():
@@ -304,42 +330,130 @@ with queue_tab:
                 st.markdown("---")
                 st.markdown("### Actions")
                 if st.button("Transcribe", key=f"transcribe_{call['id']}"):
-                    try:
-                        with st.spinner("Transcribing audio..."):
-                            transcript_text = transcribe_audio(
-                                str(audio_path), model=transcription_model
-                            )
-                            update_call(
-                                call["id"],
-                                transcript_text=transcript_text,
-                                status="transcribed",
-                                transcription_model=transcription_model,
-                                recruiter_name=edit_recruiter_name,
-                                subject_name=edit_subject_name,
-                                company_name=edit_company_name,
-                                notes=edit_notes,
-                                call_type=edit_call_type,
-                            )
-                        insert_api_usage({
-                            "user_id": current_user_id,
-                            "call_id": call["id"],
-                            "operation": "transcription",
-                            "model": transcription_model,
-                            "estimated_cost_cents": 0,
-                            "created_at": datetime.utcnow().isoformat(),
-                        })
-                        st.success("Transcription complete.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Transcription failed: {e}")
-
-                if st.button("Generate ATS Summary", key=f"summarize_{call['id']}"):
-                    refreshed_call = get_call(call["id"], user_id=query_user_id)
-                    transcript_text = refreshed_call["transcript_text"]
-                    if not transcript_text:
-                        st.error("Please transcribe the call first.")
+                    if not _check_rate_limit(current_user_id):
+                        st.error(f"Rate limit exceeded ({RATE_LIMIT_PER_HOUR} API calls/hour). Please wait.")
+                        logger.warning("Rate limit hit: user_id=%d", current_user_id)
                     else:
                         try:
+                            logger.info("Transcribe started: user_id=%d call_id=%d model=%s", current_user_id, call["id"], transcription_model)
+                            with st.spinner("Transcribing audio..."):
+                                transcript_text = transcribe_audio(
+                                    str(audio_path), model=transcription_model
+                                )
+                                update_call(
+                                    call["id"],
+                                    transcript_text=transcript_text,
+                                    status="transcribed",
+                                    transcription_model=transcription_model,
+                                    recruiter_name=edit_recruiter_name,
+                                    subject_name=edit_subject_name,
+                                    company_name=edit_company_name,
+                                    notes=edit_notes,
+                                    call_type=edit_call_type,
+                                )
+                            _record_api_call(current_user_id)
+                            insert_api_usage({
+                                "user_id": current_user_id,
+                                "call_id": call["id"],
+                                "operation": "transcription",
+                                "model": transcription_model,
+                                "estimated_cost_cents": 0,
+                                "created_at": datetime.utcnow().isoformat(),
+                            })
+                            logger.info("Transcribe complete: user_id=%d call_id=%d", current_user_id, call["id"])
+                            st.success("Transcription complete.")
+                            st.rerun()
+                        except Exception as e:
+                            logger.error("Transcribe failed: user_id=%d call_id=%d error=%s", current_user_id, call["id"], e)
+                            st.error(f"Transcription failed: {e}")
+
+                if st.button("Generate ATS Summary", key=f"summarize_{call['id']}"):
+                    if not _check_rate_limit(current_user_id):
+                        st.error(f"Rate limit exceeded ({RATE_LIMIT_PER_HOUR} API calls/hour). Please wait.")
+                        logger.warning("Rate limit hit: user_id=%d", current_user_id)
+                    else:
+                        refreshed_call = get_call(call["id"], user_id=query_user_id)
+                        transcript_text = refreshed_call["transcript_text"]
+                        if not transcript_text:
+                            st.error("Please transcribe the call first.")
+                        else:
+                            try:
+                                logger.info("Summarize started: user_id=%d call_id=%d model=%s", current_user_id, call["id"], summary_model)
+                                with st.spinner("Generating ATS-ready summary..."):
+                                    summary_text = summarize_transcript(
+                                        transcript_text=transcript_text,
+                                        call_type=edit_call_type,
+                                        metadata={
+                                            "recruiter_name": edit_recruiter_name,
+                                            "subject_name": edit_subject_name,
+                                            "company_name": edit_company_name,
+                                            "notes": edit_notes,
+                                        },
+                                        model=summary_model,
+                                    )
+                                    update_call(
+                                        call["id"],
+                                        summary_text=summary_text,
+                                        status="summarized",
+                                        summary_model=summary_model,
+                                        recruiter_name=edit_recruiter_name,
+                                        subject_name=edit_subject_name,
+                                        company_name=edit_company_name,
+                                        notes=edit_notes,
+                                        call_type=edit_call_type,
+                                    )
+                                _record_api_call(current_user_id)
+                                insert_api_usage({
+                                    "user_id": current_user_id,
+                                    "call_id": call["id"],
+                                    "operation": "summarization",
+                                    "model": summary_model,
+                                    "estimated_cost_cents": 0,
+                                    "created_at": datetime.utcnow().isoformat(),
+                                })
+                                logger.info("Summarize complete: user_id=%d call_id=%d", current_user_id, call["id"])
+                                st.success("Summary generated.")
+                                st.rerun()
+                            except Exception as e:
+                                logger.error("Summarize failed: user_id=%d call_id=%d error=%s", current_user_id, call["id"], e)
+                                st.error(f"Summary failed: {e}")
+
+                st.markdown("---")
+                if st.button(
+                    "Transcribe & Summarize",
+                    key=f"process_{call['id']}",
+                    help="Run transcription then immediately generate the ATS summary in one step.",
+                ):
+                    if not _check_rate_limit(current_user_id):
+                        st.error(f"Rate limit exceeded ({RATE_LIMIT_PER_HOUR} API calls/hour). Please wait.")
+                        logger.warning("Rate limit hit: user_id=%d", current_user_id)
+                    else:
+                        try:
+                            logger.info("Transcribe+Summarize started: user_id=%d call_id=%d", current_user_id, call["id"])
+                            with st.spinner("Transcribing audio..."):
+                                transcript_text = transcribe_audio(
+                                    str(audio_path), model=transcription_model
+                                )
+                                update_call(
+                                    call["id"],
+                                    transcript_text=transcript_text,
+                                    status="transcribed",
+                                    transcription_model=transcription_model,
+                                    recruiter_name=edit_recruiter_name,
+                                    subject_name=edit_subject_name,
+                                    company_name=edit_company_name,
+                                    notes=edit_notes,
+                                    call_type=edit_call_type,
+                                )
+                            _record_api_call(current_user_id)
+                            insert_api_usage({
+                                "user_id": current_user_id,
+                                "call_id": call["id"],
+                                "operation": "transcription",
+                                "model": transcription_model,
+                                "estimated_cost_cents": 0,
+                                "created_at": datetime.utcnow().isoformat(),
+                            })
                             with st.spinner("Generating ATS-ready summary..."):
                                 summary_text = summarize_transcript(
                                     transcript_text=transcript_text,
@@ -357,12 +471,8 @@ with queue_tab:
                                     summary_text=summary_text,
                                     status="summarized",
                                     summary_model=summary_model,
-                                    recruiter_name=edit_recruiter_name,
-                                    subject_name=edit_subject_name,
-                                    company_name=edit_company_name,
-                                    notes=edit_notes,
-                                    call_type=edit_call_type,
                                 )
+                            _record_api_call(current_user_id)
                             insert_api_usage({
                                 "user_id": current_user_id,
                                 "call_id": call["id"],
@@ -371,71 +481,12 @@ with queue_tab:
                                 "estimated_cost_cents": 0,
                                 "created_at": datetime.utcnow().isoformat(),
                             })
-                            st.success("Summary generated.")
+                            logger.info("Transcribe+Summarize complete: user_id=%d call_id=%d", current_user_id, call["id"])
+                            st.success("Transcription and summary complete.")
                             st.rerun()
                         except Exception as e:
-                            st.error(f"Summary failed: {e}")
-
-                st.markdown("---")
-                if st.button(
-                    "Transcribe & Summarize",
-                    key=f"process_{call['id']}",
-                    help="Run transcription then immediately generate the ATS summary in one step.",
-                ):
-                    try:
-                        with st.spinner("Transcribing audio..."):
-                            transcript_text = transcribe_audio(
-                                str(audio_path), model=transcription_model
-                            )
-                            update_call(
-                                call["id"],
-                                transcript_text=transcript_text,
-                                status="transcribed",
-                                transcription_model=transcription_model,
-                                recruiter_name=edit_recruiter_name,
-                                subject_name=edit_subject_name,
-                                company_name=edit_company_name,
-                                notes=edit_notes,
-                                call_type=edit_call_type,
-                            )
-                        insert_api_usage({
-                            "user_id": current_user_id,
-                            "call_id": call["id"],
-                            "operation": "transcription",
-                            "model": transcription_model,
-                            "estimated_cost_cents": 0,
-                            "created_at": datetime.utcnow().isoformat(),
-                        })
-                        with st.spinner("Generating ATS-ready summary..."):
-                            summary_text = summarize_transcript(
-                                transcript_text=transcript_text,
-                                call_type=edit_call_type,
-                                metadata={
-                                    "recruiter_name": edit_recruiter_name,
-                                    "subject_name": edit_subject_name,
-                                    "company_name": edit_company_name,
-                                    "notes": edit_notes,
-                                },
-                                model=summary_model,
-                            )
-                            update_call(
-                                call["id"],
-                                summary_text=summary_text,
-                                status="summarized",
-                                summary_model=summary_model,
-                            )
-                        insert_api_usage({
-                            "user_id": current_user_id,
-                            "call_id": call["id"],
-                            "operation": "summarization",
-                            "model": summary_model,
-                            "estimated_cost_cents": 0,
-                            "created_at": datetime.utcnow().isoformat(),
-                        })
-                        st.success("Transcription and summary complete.")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"Processing failed: {e}")
+                            logger.error("Transcribe+Summarize failed: user_id=%d call_id=%d error=%s", current_user_id, call["id"], e)
+                            st.error(f"Processing failed: {e}")
 
             with right:
                 st.markdown("### Transcript")

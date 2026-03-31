@@ -5,6 +5,7 @@ from typing import Dict, Any, List
 from openai import OpenAI
 
 from prompts import CALL_TYPE_CONFIG
+from logging_config import logger
 
 
 def get_openai_client() -> OpenAI:
@@ -17,12 +18,14 @@ def get_openai_client() -> OpenAI:
 
 
 def transcribe_audio(file_path: str, model: str = "gpt-4o-transcribe") -> str:
+    logger.info("Transcription started: model=%s file=%s", model, file_path)
     client = get_openai_client()
     with open(file_path, "rb") as audio_file:
         transcript = client.audio.transcriptions.create(
             model=model,
             file=audio_file,
         )
+    logger.info("Transcription complete: model=%s chars=%d", model, len(transcript.text))
     return transcript.text
 
 
@@ -60,6 +63,7 @@ def summarize_transcript(
     metadata: Dict[str, Any],
     model: str = "gpt-4.1",
 ) -> str:
+    logger.info("Summarization started: model=%s call_type=%s", model, call_type)
     client = get_openai_client()
     messages = build_summary_messages(transcript_text, call_type, metadata)
 
@@ -72,4 +76,6 @@ def summarize_transcript(
         model=model,
         messages=normalized,
     )
-    return response.choices[0].message.content.strip()
+    result = response.choices[0].message.content.strip()
+    logger.info("Summarization complete: model=%s chars=%d", model, len(result))
+    return result

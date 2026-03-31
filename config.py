@@ -29,6 +29,9 @@ DEFAULT_SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "gpt-4.1")
 ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@oaktreestaffing.com")
 ADMIN_DEFAULT_PASSWORD = os.getenv("ADMIN_DEFAULT_PASSWORD", "changeme123")
 
+# Rate limiting: max API calls per user per hour
+RATE_LIMIT_PER_HOUR = int(os.getenv("RATE_LIMIT_PER_HOUR", "50"))
+
 # Approximate OpenAI pricing (cents per unit) for cost tracking
 # Transcription: cents per minute of audio
 COST_PER_MINUTE_TRANSCRIPTION = {
