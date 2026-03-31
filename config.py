@@ -24,3 +24,21 @@ MAX_UPLOAD_SIZE_MB = int(os.getenv("MAX_UPLOAD_SIZE_MB", "500"))
 
 DEFAULT_TRANSCRIPTION_MODEL = os.getenv("TRANSCRIPTION_MODEL", "gpt-4o-transcribe")
 DEFAULT_SUMMARY_MODEL = os.getenv("SUMMARY_MODEL", "gpt-4.1")
+
+# Auth settings
+ADMIN_EMAIL = os.getenv("ADMIN_EMAIL", "admin@oaktreestaffing.com")
+ADMIN_DEFAULT_PASSWORD = os.getenv("ADMIN_DEFAULT_PASSWORD", "changeme123")
+
+# Approximate OpenAI pricing (cents per unit) for cost tracking
+# Transcription: cents per minute of audio
+COST_PER_MINUTE_TRANSCRIPTION = {
+    "gpt-4o-transcribe": 0.6,
+    "gpt-4o-mini-transcribe": 0.3,
+    "whisper-1": 0.6,
+}
+# Summarization: cents per 1K tokens (input + output blended estimate)
+COST_PER_1K_TOKENS_SUMMARY = {
+    "gpt-4.1": 1.0,
+    "gpt-4o": 0.5,
+    "gpt-4o-mini": 0.015,
+}

@@ -1,15 +1,22 @@
-import os
 from datetime import datetime
 from pathlib import Path
 
 import streamlit as st
 
-from config import APP_DIR, LOGO_PATH, DEFAULT_TRANSCRIPTION_MODEL, DEFAULT_SUMMARY_MODEL
+from config import APP_DIR, LOGO_PATH
 from styles import APP_CSS
 from prompts import CALL_TYPE_CONFIG
-from db import init_db, insert_call, update_call, get_all_calls, get_call
+from db import (
+    init_db, insert_call, update_call, get_all_calls, get_call,
+    insert_api_usage, get_all_users, get_usage_summary,
+)
 from openai_service import transcribe_audio, summarize_transcript
 from file_service import save_uploaded_file, ffmpeg_available
+from auth import (
+    authenticate, login, logout, get_current_user, is_admin,
+    ensure_admin_exists, create_user,
+)
+from db import update_user
 
 # ============================================================
 # Recruiter Call Review Tool
@@ -20,6 +27,7 @@ st.set_page_config(page_title="Recruiter Call Review Tool", layout="wide")
 st.markdown(APP_CSS, unsafe_allow_html=True)
 
 init_db()
+ensure_admin_exists()
 
 
 def resolve_audio_path(stored_path: str) -> Path:
@@ -31,9 +39,61 @@ def resolve_audio_path(stored_path: str) -> Path:
 
 
 # -----------------------------
+# Login page
+# -----------------------------
+def show_login_page():
+    col_spacer_l, col_center, col_spacer_r = st.columns([1, 2, 1])
+    with col_center:
+        if LOGO_PATH.exists():
+            st.image(str(LOGO_PATH), width=150)
+        st.markdown("### Recruiter Call Review Tool")
+        st.markdown("Sign in to continue.")
+
+        with st.form("login_form"):
+            email = st.text_input("Email")
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Sign In", use_container_width=True)
+
+            if submitted:
+                if not email or not password:
+                    st.error("Please enter your email and password.")
+                else:
+                    user = authenticate(email, password)
+                    if user:
+                        login(user)
+                        st.rerun()
+                    else:
+                        st.error("Invalid email or password, or account is deactivated.")
+
+
+# -----------------------------
+# Auth gate
+# -----------------------------
+if not st.session_state.get("authenticated"):
+    show_login_page()
+    st.stop()
+
+current_user = get_current_user()
+current_user_id = current_user["id"]
+user_is_admin = is_admin()
+
+# For user-scoped queries: admin sees all (user_id=None), recruiter sees own
+query_user_id = None if user_is_admin else current_user_id
+
+
+# -----------------------------
 # Sidebar
 # -----------------------------
 with st.sidebar:
+    st.markdown(f"**{current_user['display_name']}**")
+    st.caption(current_user["email"])
+    if user_is_admin:
+        st.caption("Role: Admin")
+    if st.button("Sign Out", use_container_width=True):
+        logout()
+        st.rerun()
+
+    st.markdown("---")
     st.header("Settings")
     st.caption(f"ffmpeg detected: {'Yes' if ffmpeg_available() else 'No'}")
 
@@ -48,9 +108,6 @@ with st.sidebar:
         options=["gpt-4.1", "gpt-4o", "gpt-4o-mini"],
         index=0,
     )
-
-    st.markdown("---")
-    st.caption("V1 is review-first: upload > convert > transcribe > summarize > edit > copy.")
 
 
 # -----------------------------
@@ -71,7 +128,15 @@ with hero_right:
         unsafe_allow_html=True,
     )
 
-queue_tab, upload_tab = st.tabs(["Call Queue", "Upload New Recording"])
+# Build tabs — admin gets an extra tab
+tab_names = ["Call Queue", "Upload New Recording"]
+if user_is_admin:
+    tab_names.append("Admin")
+
+tabs = st.tabs(tab_names)
+queue_tab = tabs[0]
+upload_tab = tabs[1]
+admin_tab = tabs[2] if user_is_admin else None
 
 # -----------------------------
 # Upload tab
@@ -88,7 +153,7 @@ with upload_tab:
 
         col1, col2 = st.columns(2)
         with col1:
-            recruiter_name = st.text_input("Recruiter Name")
+            recruiter_name = st.text_input("Recruiter Name", value=current_user["display_name"])
             subject_name = st.text_input("Candidate / Reference / Contact Name")
         with col2:
             company_name = st.text_input("Company / Client")
@@ -121,6 +186,7 @@ with upload_tab:
                         "summary_text": None,
                         "transcription_model": None,
                         "summary_model": None,
+                        "user_id": current_user_id,
                     }
                     new_id = insert_call(record)
                     st.success(f"Recording saved. Call ID: {new_id}")
@@ -137,7 +203,7 @@ with upload_tab:
 # -----------------------------
 with queue_tab:
     st.subheader("Call Queue")
-    calls = get_all_calls()
+    calls = get_all_calls(user_id=query_user_id)
 
     if not calls:
         st.info("No calls saved yet. Upload a recording to get started.")
@@ -154,7 +220,7 @@ with queue_tab:
         options = {_call_label(row): row["id"] for row in calls}
         selected_label = st.selectbox("Select a call", list(options.keys()))
         selected_id = options[selected_label]
-        call = get_call(selected_id)
+        call = get_call(selected_id, user_id=query_user_id)
 
         if call:
             left, right = st.columns([1, 1])
@@ -254,13 +320,21 @@ with queue_tab:
                                 notes=edit_notes,
                                 call_type=edit_call_type,
                             )
+                        insert_api_usage({
+                            "user_id": current_user_id,
+                            "call_id": call["id"],
+                            "operation": "transcription",
+                            "model": transcription_model,
+                            "estimated_cost_cents": 0,
+                            "created_at": datetime.utcnow().isoformat(),
+                        })
                         st.success("Transcription complete.")
                         st.rerun()
                     except Exception as e:
                         st.error(f"Transcription failed: {e}")
 
                 if st.button("Generate ATS Summary", key=f"summarize_{call['id']}"):
-                    refreshed_call = get_call(call["id"])
+                    refreshed_call = get_call(call["id"], user_id=query_user_id)
                     transcript_text = refreshed_call["transcript_text"]
                     if not transcript_text:
                         st.error("Please transcribe the call first.")
@@ -289,6 +363,14 @@ with queue_tab:
                                     notes=edit_notes,
                                     call_type=edit_call_type,
                                 )
+                            insert_api_usage({
+                                "user_id": current_user_id,
+                                "call_id": call["id"],
+                                "operation": "summarization",
+                                "model": summary_model,
+                                "estimated_cost_cents": 0,
+                                "created_at": datetime.utcnow().isoformat(),
+                            })
                             st.success("Summary generated.")
                             st.rerun()
                         except Exception as e:
@@ -316,6 +398,14 @@ with queue_tab:
                                 notes=edit_notes,
                                 call_type=edit_call_type,
                             )
+                        insert_api_usage({
+                            "user_id": current_user_id,
+                            "call_id": call["id"],
+                            "operation": "transcription",
+                            "model": transcription_model,
+                            "estimated_cost_cents": 0,
+                            "created_at": datetime.utcnow().isoformat(),
+                        })
                         with st.spinner("Generating ATS-ready summary..."):
                             summary_text = summarize_transcript(
                                 transcript_text=transcript_text,
@@ -334,6 +424,14 @@ with queue_tab:
                                 status="summarized",
                                 summary_model=summary_model,
                             )
+                        insert_api_usage({
+                            "user_id": current_user_id,
+                            "call_id": call["id"],
+                            "operation": "summarization",
+                            "model": summary_model,
+                            "estimated_cost_cents": 0,
+                            "created_at": datetime.utcnow().isoformat(),
+                        })
                         st.success("Transcription and summary complete.")
                         st.rerun()
                     except Exception as e:
@@ -404,3 +502,83 @@ with queue_tab:
                     st.write(
                         f"**Summary Model:** {call['summary_model'] or summary_model}"
                     )
+
+
+# -----------------------------
+# Admin tab
+# -----------------------------
+if admin_tab is not None:
+    with admin_tab:
+        st.subheader("Administration")
+
+        # --- User Management ---
+        st.markdown("### User Management")
+        users = get_all_users()
+
+        if users:
+            for u in users:
+                col_name, col_email, col_role, col_status, col_action = st.columns([2, 3, 1, 1, 2])
+                with col_name:
+                    st.write(u["display_name"])
+                with col_email:
+                    st.write(u["email"])
+                with col_role:
+                    st.write(u["role"])
+                with col_status:
+                    st.write("Active" if u["is_active"] else "Inactive")
+                with col_action:
+                    if u["id"] != current_user_id:
+                        if u["is_active"]:
+                            if st.button("Deactivate", key=f"deact_{u['id']}"):
+                                update_user(u["id"], is_active=0)
+                                st.rerun()
+                        else:
+                            if st.button("Activate", key=f"act_{u['id']}"):
+                                update_user(u["id"], is_active=1)
+                                st.rerun()
+
+        st.markdown("---")
+        st.markdown("### Create New User")
+        with st.form("create_user_form"):
+            new_email = st.text_input("Email")
+            new_name = st.text_input("Display Name")
+            new_password = st.text_input("Password", type="password")
+            new_role = st.selectbox("Role", options=["recruiter", "admin"])
+            create_submitted = st.form_submit_button("Create User")
+
+            if create_submitted:
+                if not new_email or not new_name or not new_password:
+                    st.error("All fields are required.")
+                elif len(new_password) < 6:
+                    st.error("Password must be at least 6 characters.")
+                else:
+                    try:
+                        create_user(new_email, new_name, new_password, new_role)
+                        st.success(f"User {new_email} created.")
+                        st.rerun()
+                    except Exception as e:
+                        if "UNIQUE constraint" in str(e):
+                            st.error("A user with that email already exists.")
+                        else:
+                            st.error(f"Failed to create user: {e}")
+
+        # --- API Usage ---
+        st.markdown("---")
+        st.markdown("### API Usage (Last 30 Days)")
+        usage_summary = get_usage_summary(days=30)
+        if usage_summary:
+            import pandas as pd
+            df = pd.DataFrame([dict(row) for row in usage_summary])
+            df = df.rename(columns={
+                "display_name": "User",
+                "email": "Email",
+                "total_calls": "API Calls",
+                "transcriptions": "Transcriptions",
+                "summarizations": "Summaries",
+                "total_cost_cents": "Est. Cost ($)",
+            })
+            if "Est. Cost ($)" in df.columns:
+                df["Est. Cost ($)"] = (df["Est. Cost ($)"].fillna(0) / 100).map("${:.2f}".format)
+            st.dataframe(df, use_container_width=True, hide_index=True)
+        else:
+            st.info("No API usage recorded yet.")
