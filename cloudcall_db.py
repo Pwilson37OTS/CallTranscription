@@ -34,6 +34,8 @@ def init_cloudcall_tables() -> None:
                 cloudcall_user_id TEXT,
                 app_user_id INTEGER REFERENCES users(id),
                 recording_url TEXT NOT NULL,
+                recruiter_name TEXT,
+                contact_name TEXT,
                 caller_number TEXT,
                 callee_number TEXT,
                 direction TEXT,
@@ -47,6 +49,16 @@ def init_cloudcall_tables() -> None:
             )
             """
         )
+        # Auto-migrate: add columns that may not exist in older DBs
+        existing_cols = {
+            row[1]
+            for row in conn.execute("PRAGMA table_info(cloudcall_recordings)").fetchall()
+        }
+        if "recruiter_name" not in existing_cols:
+            conn.execute("ALTER TABLE cloudcall_recordings ADD COLUMN recruiter_name TEXT")
+        if "contact_name" not in existing_cols:
+            conn.execute("ALTER TABLE cloudcall_recordings ADD COLUMN contact_name TEXT")
+
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_cc_mapping_cloudcall_user "
             "ON cloudcall_user_mapping(cloudcall_user_id)"
@@ -146,16 +158,19 @@ def insert_cloudcall_recording(record: Dict[str, Any]) -> int:
             """
             INSERT INTO cloudcall_recordings (
                 cloudcall_recording_id, cloudcall_user_id, app_user_id,
-                recording_url, caller_number, callee_number, direction,
+                recording_url, recruiter_name, contact_name,
+                caller_number, callee_number, direction,
                 call_duration_seconds, call_timestamp, status,
                 webhook_received_at, webhook_payload
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record["cloudcall_recording_id"],
                 record.get("cloudcall_user_id"),
                 record.get("app_user_id"),
                 record["recording_url"],
+                record.get("recruiter_name"),
+                record.get("contact_name"),
                 record.get("caller_number"),
                 record.get("callee_number"),
                 record.get("direction"),

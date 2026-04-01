@@ -391,6 +391,8 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
                 "cloudcall_user_id": cloudcall_user_id,
                 "app_user_id": app_user_id,
                 "recording_url": rec_url,
+                "recruiter_name": call.get("user_name", ""),
+                "contact_name": call.get("contact_name", ""),
                 "caller_number": call.get("user_number", ""),
                 "callee_number": call.get("contact_number", ""),
                 "direction": call.get("direction", ""),

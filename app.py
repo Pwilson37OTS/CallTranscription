@@ -601,12 +601,37 @@ if cloudcall_tab is not None:
         if not cc_recordings:
             st.info("No CloudCall recordings in the last 48 hours.")
         else:
+            from zoneinfo import ZoneInfo
+            CT = ZoneInfo("America/Chicago")
+            UTC = ZoneInfo("UTC")
+
+            # Column headers
+            hdr_check, hdr_time, hdr_recruiter, hdr_contact, hdr_dur, hdr_dir, hdr_status = st.columns(
+                [0.5, 2.5, 2, 2.5, 1, 1, 1.5]
+            )
+            with hdr_check:
+                st.markdown("**Sel**")
+            with hdr_time:
+                st.markdown("**Date/Time (CT)**")
+            with hdr_recruiter:
+                st.markdown("**Recruiter**")
+            with hdr_contact:
+                st.markdown("**Contact**")
+            with hdr_dur:
+                st.markdown("**Duration**")
+            with hdr_dir:
+                st.markdown("**Direction**")
+            with hdr_status:
+                st.markdown("**Status**")
+
+            st.divider()
+
             # Display recordings with checkboxes for selection
             selected_ids = []
             for rec in cc_recordings:
                 rec_id = rec["id"]
-                col_check, col_time, col_from, col_to, col_dur, col_dir, col_status = st.columns(
-                    [0.5, 2, 2, 2, 1, 1, 1.5]
+                col_check, col_time, col_recruiter, col_contact, col_dur, col_dir, col_status = st.columns(
+                    [0.5, 2.5, 2, 2.5, 1, 1, 1.5]
                 )
 
                 with col_check:
@@ -616,23 +641,48 @@ if cloudcall_tab is not None:
 
                 with col_time:
                     try:
-                        ts = datetime.fromisoformat(rec["call_timestamp"])
-                        st.write(ts.strftime("%b %d %I:%M %p"))
+                        ts_str = rec["call_timestamp"]
+                        ts = datetime.fromisoformat(ts_str.replace(" ", "T"))
+                        # Assume UTC if naive, convert to Central
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=UTC)
+                        ts_ct = ts.astimezone(CT)
+                        st.write(ts_ct.strftime("%b %d, %I:%M %p"))
                     except Exception:
                         st.write(rec["call_timestamp"][:16])
 
-                with col_from:
-                    st.write(rec["caller_number"] or "—")
+                with col_recruiter:
+                    recruiter = rec["recruiter_name"] if rec["recruiter_name"] else ""
+                    if not recruiter:
+                        recruiter = rec["caller_number"] or "—"
+                    st.write(recruiter)
 
-                with col_to:
-                    st.write(rec["callee_number"] or "—")
+                with col_contact:
+                    contact = rec["contact_name"] if rec["contact_name"] else ""
+                    number = rec["callee_number"] or ""
+                    if contact and number and contact != number:
+                        st.write(f"{contact} ({number})")
+                    elif contact:
+                        st.write(contact)
+                    elif number:
+                        st.write(number)
+                    else:
+                        st.write("—")
 
                 with col_dur:
                     dur = rec["call_duration_seconds"] or 0
-                    st.write(f"{dur // 60}:{dur % 60:02d}")
+                    mins = dur // 60
+                    secs = dur % 60
+                    st.write(f"{mins}:{secs:02d}")
 
                 with col_dir:
-                    st.write(rec["direction"] or "—")
+                    direction = (rec["direction"] or "").capitalize()
+                    if direction == "Inbound":
+                        st.write("Inbound")
+                    elif direction == "Outbound":
+                        st.write("Outbound")
+                    else:
+                        st.write(direction or "—")
 
                 with col_status:
                     status = rec["status"]
