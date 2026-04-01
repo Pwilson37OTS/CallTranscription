@@ -1,10 +1,16 @@
 """CloudCall API client and recording import pipeline.
 
-Handles downloading recordings from CloudCall and importing them
-into the existing transcription/summarization pipeline.
+Handles OAuth2 token refresh, downloading recordings from CloudCall,
+and importing them into the existing transcription/summarization pipeline.
+
+Auth flow:
+  POST https://auth.cloudcall.com/connect/token
+  Body: client_id=o1-public-api&grant_type=refresh_token&refresh_token=<token>
+  Returns: access_token (24hr), new refresh_token
 """
 
 import logging
+import os
 from datetime import datetime
 from pathlib import Path
 from time import time
@@ -15,8 +21,9 @@ import httpx
 from config import CONVERTED_DIR
 from cloudcall_config import (
     CLOUDCALL_API_BASE_URL,
-    CLOUDCALL_API_KEY,
-    CLOUDCALL_API_SECRET,
+    CLOUDCALL_AUTH_URL,
+    CLOUDCALL_CLIENT_ID,
+    CLOUDCALL_REFRESH_TOKEN,
     CLOUDCALL_DOWNLOAD_DIR,
     CLOUDCALL_RECORDING_RETENTION_HOURS,
 )
@@ -34,9 +41,54 @@ logger = logging.getLogger("calltranscription.cloudcall")
 _last_cleanup_time: float = 0.0
 _CLEANUP_INTERVAL_SECONDS = 900
 
+# In-memory token cache
+_access_token: str = ""
+_access_token_expires_at: float = 0.0
+_current_refresh_token: str = CLOUDCALL_REFRESH_TOKEN
+
+
+def get_access_token() -> str:
+    """Get a valid CloudCall access token, refreshing if needed.
+
+    The refresh token flow returns a new refresh_token each time,
+    which we store in memory for subsequent calls. The initial
+    refresh_token comes from the CLOUDCALL_REFRESH_TOKEN env var.
+    """
+    global _access_token, _access_token_expires_at, _current_refresh_token
+
+    # Return cached token if still valid (with 5 min buffer)
+    if _access_token and time() < (_access_token_expires_at - 300):
+        return _access_token
+
+    if not _current_refresh_token:
+        raise RuntimeError("CLOUDCALL_REFRESH_TOKEN is not configured")
+
+    with httpx.Client(timeout=30.0) as client:
+        response = client.post(
+            CLOUDCALL_AUTH_URL,
+            data={
+                "client_id": CLOUDCALL_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": _current_refresh_token,
+            },
+        )
+        response.raise_for_status()
+
+    token_data = response.json()
+    _access_token = token_data["access_token"]
+    _access_token_expires_at = time() + token_data.get("expires_in", 86400)
+    _current_refresh_token = token_data.get("refresh_token", _current_refresh_token)
+
+    logger.info("CloudCall access token refreshed, expires in %ds", token_data.get("expires_in", 0))
+    return _access_token
+
 
 def download_recording(recording_url: str, cloudcall_recording_id: str) -> Path:
-    """Download a recording from CloudCall API.
+    """Download a recording from CloudCall.
+
+    CloudCall webhook recording URLs are temporary pre-signed URLs,
+    so they may not need auth headers. We try without auth first,
+    then fall back to Bearer token auth if that fails.
 
     Args:
         recording_url: The URL to download the recording from.
@@ -45,12 +97,19 @@ def download_recording(recording_url: str, cloudcall_recording_id: str) -> Path:
     Returns:
         Path to the downloaded file.
     """
-    headers = {}
-    if CLOUDCALL_API_KEY:
-        headers["Authorization"] = f"Bearer {CLOUDCALL_API_KEY}"
-
     with httpx.Client(timeout=120.0) as client:
-        response = client.get(recording_url, headers=headers, follow_redirects=True)
+        # Try direct download first (temp URLs are often pre-signed)
+        response = client.get(recording_url, follow_redirects=True)
+
+        if response.status_code in (401, 403):
+            # Fall back to authenticated download
+            token = get_access_token()
+            response = client.get(
+                recording_url,
+                headers={"Authorization": f"Bearer {token}"},
+                follow_redirects=True,
+            )
+
         response.raise_for_status()
 
     # Determine file extension from content-type or URL
@@ -123,9 +182,8 @@ def import_recording_to_pipeline(
         wav_path = convert_file_to_wav(download_path, CLOUDCALL_DOWNLOAD_DIR)
 
         # Build the original filename for display
-        caller = recording["caller_number"] or "unknown"
-        callee = recording["callee_number"] or "unknown"
-        original_filename = f"cloudcall_{caller}_to_{callee}_{recording['cloudcall_recording_id']}{download_path.suffix}"
+        call_id_short = recording["cloudcall_recording_id"][:20]
+        original_filename = f"cloudcall_{call_id_short}{download_path.suffix}"
 
         # Store relative path from project root
         relative_path = wav_path.relative_to(Path(__file__).parent)
@@ -140,7 +198,7 @@ def import_recording_to_pipeline(
             "recruiter_name": metadata.get("recruiter_name", ""),
             "subject_name": metadata.get("subject_name", ""),
             "company_name": metadata.get("company_name", ""),
-            "notes": metadata.get("notes", f"Imported from CloudCall. Direction: {recording['direction'] or 'unknown'}"),
+            "notes": metadata.get("notes", "Imported from CloudCall"),
             "call_type": call_type,
             "status": "uploaded",
             "user_id": user_id,

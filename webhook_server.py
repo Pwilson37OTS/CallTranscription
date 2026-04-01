@@ -1,7 +1,13 @@
-"""FastAPI webhook receiver for CloudCall recording notifications.
+"""FastAPI webhook receiver for CloudCall event notifications.
 
 Runs as a sidecar alongside Streamlit on port 8080.
 Start with: uvicorn webhook_server:app --host 0.0.0.0 --port 8080
+
+CloudCall sends ALL events (SMS, CallStart, CallComplete, CallRecording, etc.)
+to a single registered endpoint. This server filters for CallRecording events
+and ignores the rest.
+
+Webhook signature: x-cloudcall-sig header = HMAC-SHA256(body, signing_key)
 """
 
 import hashlib
@@ -10,11 +16,12 @@ import json
 import logging
 from datetime import datetime
 from time import time
+from typing import List, Optional
 
 from fastapi import FastAPI, Request, HTTPException
 from pydantic import BaseModel, Field
 
-from cloudcall_config import CLOUDCALL_WEBHOOK_SECRET, CLOUDCALL_RECORDING_RETENTION_HOURS
+from cloudcall_config import CLOUDCALL_WEBHOOK_SIGNING_KEY, CLOUDCALL_RECORDING_RETENTION_HOURS
 from cloudcall_db import (
     init_cloudcall_tables,
     insert_cloudcall_recording,
@@ -34,24 +41,30 @@ _last_cleanup_time: float = 0.0
 _CLEANUP_INTERVAL_SECONDS = 900
 
 
-class RecordingReadyPayload(BaseModel):
-    recording_id: str = Field(..., description="CloudCall unique recording ID")
-    user_id: str = Field(default="", description="CloudCall user ID / extension")
-    recording_url: str = Field(..., description="URL to download the recording")
-    caller_number: str = Field(default="")
-    callee_number: str = Field(default="")
-    direction: str = Field(default="")
-    duration: int = Field(default=0, description="Call duration in seconds")
-    timestamp: str = Field(..., description="Call timestamp (ISO 8601)")
+# --- CloudCall webhook payload models (matching actual API schemas) ---
+
+class CloudCallUser(BaseModel):
+    id: str = Field(default="")
+    email: str = Field(default="")
+
+
+class CloudCallRecordingItem(BaseModel):
+    url: str = Field(..., description="Temporary recording URL")
+
+
+class CallRecordingEvent(BaseModel):
+    callId: str = Field(..., description="Session ID of the call")
+    user: CloudCallUser = Field(default_factory=CloudCallUser)
+    recordings: List[CloudCallRecordingItem] = Field(default_factory=list)
 
 
 def _verify_signature(body: bytes, signature: str) -> bool:
-    """Verify HMAC-SHA256 webhook signature."""
-    if not CLOUDCALL_WEBHOOK_SECRET:
-        logger.warning("CLOUDCALL_WEBHOOK_SECRET not set — skipping signature verification")
+    """Verify HMAC-SHA256 webhook signature using the signing_key."""
+    if not CLOUDCALL_WEBHOOK_SIGNING_KEY:
+        logger.warning("CLOUDCALL_WEBHOOK_SIGNING_KEY not set — skipping signature verification")
         return True
     expected = hmac.new(
-        CLOUDCALL_WEBHOOK_SECRET.encode("utf-8"),
+        CLOUDCALL_WEBHOOK_SIGNING_KEY.encode("utf-8"),
         body,
         hashlib.sha256,
     ).hexdigest()
@@ -77,65 +90,91 @@ async def health():
     return {"status": "ok"}
 
 
-@app.post("/webhooks/cloudcall/recording-ready")
-async def recording_ready(request: Request):
+@app.post("/webhooks/cloudcall")
+async def cloudcall_webhook(request: Request):
+    """Receive all CloudCall webhook events. Filters for CallRecording events."""
     body = await request.body()
 
-    # Validate webhook signature
-    signature = request.headers.get("X-CloudCall-Signature", "")
-    if CLOUDCALL_WEBHOOK_SECRET and not _verify_signature(body, signature):
+    # Validate webhook signature (x-cloudcall-sig header)
+    signature = request.headers.get("x-cloudcall-sig", "")
+    if CLOUDCALL_WEBHOOK_SIGNING_KEY and not _verify_signature(body, signature):
         logger.warning("Webhook rejected: invalid signature")
         raise HTTPException(status_code=401, detail="Invalid signature")
 
-    # Parse payload
+    # Parse JSON body
     try:
-        payload = RecordingReadyPayload.model_validate_json(body)
+        data = json.loads(body)
     except Exception as e:
-        logger.warning("Webhook rejected: malformed payload: %s", e)
+        logger.warning("Webhook rejected: invalid JSON: %s", e)
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # Determine event type — CallRecording events have "recordings" array
+    if "recordings" not in data:
+        # Not a recording event (could be CallStart, CallComplete, SMS, Note, etc.)
+        # Acknowledge and ignore
+        logger.debug("Non-recording webhook event received, ignoring")
+        return {"status": "ok", "detail": "event type not handled"}
+
+    # Parse as CallRecording event
+    try:
+        event = CallRecordingEvent.model_validate(data)
+    except Exception as e:
+        logger.warning("Webhook rejected: malformed CallRecording payload: %s", e)
         raise HTTPException(status_code=400, detail=f"Invalid payload: {e}")
 
-    # Look up CloudCall user -> app user mapping
+    if not event.recordings:
+        logger.info("CallRecording event with empty recordings array, ignoring: callId=%s", event.callId)
+        return {"status": "ok", "detail": "no recordings in event"}
+
+    # Look up CloudCall user -> app user mapping (try user.id first, then email)
     app_user_id = None
-    if payload.user_id:
-        mapping = get_cloudcall_user_mapping(payload.user_id)
+    cloudcall_user_id = event.user.id or event.user.email or None
+    if cloudcall_user_id:
+        mapping = get_cloudcall_user_mapping(cloudcall_user_id)
+        if not mapping and event.user.email and event.user.id:
+            # Try email as fallback lookup
+            mapping = get_cloudcall_user_mapping(event.user.email)
         if mapping:
             app_user_id = mapping["app_user_id"]
         else:
             logger.warning(
-                "Unmapped CloudCall user_id=%s for recording=%s",
-                payload.user_id,
-                payload.recording_id,
+                "Unmapped CloudCall user id=%s email=%s for callId=%s",
+                event.user.id, event.user.email, event.callId,
             )
 
-    # Insert recording (idempotent: skip duplicates)
-    try:
-        insert_cloudcall_recording({
-            "cloudcall_recording_id": payload.recording_id,
-            "cloudcall_user_id": payload.user_id or None,
-            "app_user_id": app_user_id,
-            "recording_url": payload.recording_url,
-            "caller_number": payload.caller_number,
-            "callee_number": payload.callee_number,
-            "direction": payload.direction,
-            "call_duration_seconds": payload.duration,
-            "call_timestamp": payload.timestamp,
-            "status": "available",
-            "webhook_received_at": datetime.utcnow().isoformat(),
-            "webhook_payload": body.decode("utf-8", errors="replace"),
-        })
+    # Insert one row per recording URL (usually just one)
+    inserted = 0
+    for i, rec in enumerate(event.recordings):
+        recording_id = f"{event.callId}" if len(event.recordings) == 1 else f"{event.callId}_{i}"
+        try:
+            insert_cloudcall_recording({
+                "cloudcall_recording_id": recording_id,
+                "cloudcall_user_id": cloudcall_user_id,
+                "app_user_id": app_user_id,
+                "recording_url": rec.url,
+                "caller_number": "",
+                "callee_number": "",
+                "direction": "",
+                "call_duration_seconds": None,
+                "call_timestamp": datetime.utcnow().isoformat(),
+                "status": "available",
+                "webhook_received_at": datetime.utcnow().isoformat(),
+                "webhook_payload": body.decode("utf-8", errors="replace"),
+            })
+            inserted += 1
+        except Exception as e:
+            if "UNIQUE constraint" in str(e):
+                logger.info("Duplicate recording ignored: %s", recording_id)
+            else:
+                logger.error("Failed to insert recording %s: %s", recording_id, e)
+
+    if inserted > 0:
         logger.info(
-            "Webhook processed: recording=%s user=%s app_user_id=%s",
-            payload.recording_id,
-            payload.user_id,
-            app_user_id,
+            "Webhook processed: callId=%s user=%s app_user_id=%s recordings=%d",
+            event.callId, cloudcall_user_id, app_user_id, inserted,
         )
-    except Exception as e:
-        if "UNIQUE constraint" in str(e):
-            logger.info("Duplicate webhook ignored: recording=%s", payload.recording_id)
-            return {"status": "ok", "detail": "duplicate ignored"}
-        raise
 
     # Opportunistic cleanup
     _maybe_cleanup()
 
-    return {"status": "ok"}
+    return {"status": "ok", "recordings_inserted": inserted}
