@@ -1,6 +1,7 @@
 FROM python:3.12-slim
 
-# Install ffmpeg and supervisor for multi-process management
+# Cache bust: 2026-03-31
+# Install ffmpeg, supervisor, nginx, and curl
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg supervisor curl nginx && \
     rm -rf /var/lib/apt/lists/*
