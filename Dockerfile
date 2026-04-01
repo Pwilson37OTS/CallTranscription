@@ -2,7 +2,7 @@ FROM python:3.12-slim
 
 # Install ffmpeg and supervisor for multi-process management
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg supervisor curl && \
+    apt-get install -y --no-install-recommends ffmpeg supervisor curl nginx && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -17,8 +17,8 @@ COPY . .
 # Create data directories
 RUN mkdir -p data/uploads data/converted data/logs data/cloudcall_downloads
 
-EXPOSE 8501 8080
+EXPOSE 8080
 
-HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health || exit 1
+HEALTHCHECK CMD curl --fail http://localhost:8080/health || exit 1
 
 ENTRYPOINT ["supervisord", "-c", "supervisord.conf"]
