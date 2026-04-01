@@ -1,11 +1,13 @@
 """FastAPI webhook receiver for CloudCall event notifications.
 
-Runs as a sidecar alongside Streamlit on port 8080.
-Start with: uvicorn webhook_server:app --host 0.0.0.0 --port 8080
+Runs as a sidecar alongside Streamlit behind nginx on port 8081.
+Start with: uvicorn webhook_server:app --host 127.0.0.1 --port 8081
 
 CloudCall sends ALL events (SMS, CallStart, CallComplete, CallRecording, etc.)
-to a single registered endpoint. This server filters for CallRecording events
-and ignores the rest.
+to a single registered endpoint wrapped in a common envelope:
+  {eventType, timestamp, customerId, eventDetails: {...}}
+
+This server filters for recording-related events and ignores the rest.
 
 Webhook signature: x-cloudcall-sig header = HMAC-SHA256(body, signing_key)
 """
@@ -39,6 +41,9 @@ init_cloudcall_tables()
 # Throttle cleanup to max once per 15 minutes
 _last_cleanup_time: float = 0.0
 _CLEANUP_INTERVAL_SECONDS = 900
+
+# Event types that contain recording data
+_RECORDING_EVENT_TYPES = {"call_recording", "callrecording"}
 
 
 # --- CloudCall webhook payload models (matching actual API schemas) ---
@@ -85,6 +90,31 @@ def _maybe_cleanup():
             logger.error("Cleanup failed: %s", e)
 
 
+def _extract_recording_event(data: dict) -> Optional[dict]:
+    """Extract the CallRecording event details from the webhook payload.
+
+    CloudCall webhooks come in two possible shapes:
+    1. Envelope format: {eventType, timestamp, customerId, eventDetails: {...}}
+    2. Flat format (legacy/direct): {callId, user, recordings}
+
+    Returns the recording event dict, or None if not a recording event.
+    """
+    # Envelope format: check eventType
+    if "eventType" in data:
+        event_type = data["eventType"].lower().replace("_", "")
+        if event_type in {"callrecording"}:
+            return data.get("eventDetails", data)
+        # Not a recording event
+        return None
+
+    # Flat format: check for recordings key
+    if "recordings" in data:
+        return data
+
+    # Unknown event type
+    return None
+
+
 @app.get("/health")
 async def health():
     return {"status": "ok"}
@@ -108,16 +138,16 @@ async def cloudcall_webhook(request: Request):
         logger.warning("Webhook rejected: invalid JSON: %s", e)
         raise HTTPException(status_code=400, detail="Invalid JSON")
 
-    # Determine event type — CallRecording events have "recordings" array
-    if "recordings" not in data:
-        # Not a recording event (could be CallStart, CallComplete, SMS, Note, etc.)
-        # Acknowledge and ignore
-        logger.debug("Non-recording webhook event received, ignoring")
+    # Extract recording event (handles both envelope and flat formats)
+    recording_data = _extract_recording_event(data)
+    if recording_data is None:
+        event_type = data.get("eventType", "unknown")
+        logger.debug("Non-recording webhook event received (%s), ignoring", event_type)
         return {"status": "ok", "detail": "event type not handled"}
 
     # Parse as CallRecording event
     try:
-        event = CallRecordingEvent.model_validate(data)
+        event = CallRecordingEvent.model_validate(recording_data)
     except Exception as e:
         logger.warning("Webhook rejected: malformed CallRecording payload: %s", e)
         raise HTTPException(status_code=400, detail=f"Invalid payload: {e}")
@@ -156,7 +186,7 @@ async def cloudcall_webhook(request: Request):
                 "callee_number": "",
                 "direction": "",
                 "call_duration_seconds": None,
-                "call_timestamp": datetime.utcnow().isoformat(),
+                "call_timestamp": data.get("timestamp", datetime.utcnow().isoformat()),
                 "status": "available",
                 "webhook_received_at": datetime.utcnow().isoformat(),
                 "webhook_payload": body.decode("utf-8", errors="replace"),

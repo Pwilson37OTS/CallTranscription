@@ -27,7 +27,36 @@ def _sign(body: bytes, secret: str = "test-secret-123") -> str:
 
 
 def _make_recording_event(overrides=None):
-    """Build a CloudCall CallRecording webhook event payload."""
+    """Build a CloudCall CallRecording webhook event in envelope format."""
+    event_details = {
+        "callId": "call-test-001",
+        "user": {
+            "id": "ext-100",
+            "email": "recruiter@oaktree.com",
+        },
+        "recordings": [
+            {"url": "https://recordings.cloudcall.com/temp/call-test-001.mp3"}
+        ],
+    }
+    if overrides:
+        # Allow overriding eventDetails fields
+        for key in ("callId", "user", "recordings"):
+            if key in overrides:
+                event_details[key] = overrides.pop(key)
+
+    base = {
+        "eventType": "call_recording",
+        "timestamp": "2026-03-31T22:00:00Z",
+        "customerId": "21c47dc9-3cbd-441d-b5c0-1c81270768c1",
+        "eventDetails": event_details,
+    }
+    if overrides:
+        base.update(overrides)
+    return base
+
+
+def _make_flat_recording_event(overrides=None):
+    """Build a CloudCall CallRecording webhook event in flat (legacy) format."""
     base = {
         "callId": "call-test-001",
         "user": {
@@ -50,7 +79,9 @@ class TestHealthEndpoint:
         assert response.json()["status"] == "ok"
 
 
-class TestCloudCallWebhook:
+class TestCloudCallWebhookEnvelopeFormat:
+    """Tests using the real CloudCall envelope format: {eventType, eventDetails}."""
+
     def test_valid_recording_event(self, webhook_client):
         payload = _make_recording_event()
         body = json.dumps(payload).encode("utf-8")
@@ -101,12 +132,64 @@ class TestCloudCallWebhook:
         assert resp2.status_code == 200
         assert resp2.json()["recordings_inserted"] == 0  # duplicate ignored
 
-    def test_non_recording_event_ignored(self, webhook_client):
-        """Non-recording events (CallStart, SMS, etc.) should be acknowledged but ignored."""
+    def test_call_start_event_ignored(self, webhook_client):
+        """Non-recording events should be acknowledged but ignored."""
         payload = {
-            "callId": "call-start-001",
-            "user": {"id": "ext-100", "email": "test@test.com"},
-            "status": "ringing",
+            "eventType": "call_start",
+            "timestamp": "2026-03-31T22:00:00Z",
+            "customerId": "cust-123",
+            "eventDetails": {
+                "callId": "call-start-001",
+                "user": {"id": "ext-100", "email": "test@test.com"},
+                "fromNumber": "+15551234567",
+                "toNumber": "+15559876543",
+                "direction": "outbound",
+            },
+        }
+        body = json.dumps(payload).encode("utf-8")
+        signature = _sign(body)
+
+        response = webhook_client.post(
+            "/webhooks/cloudcall",
+            content=body,
+            headers={"x-cloudcall-sig": signature, "Content-Type": "application/json"},
+        )
+        assert response.status_code == 200
+        assert "not handled" in response.json().get("detail", "")
+
+    def test_call_complete_event_ignored(self, webhook_client):
+        payload = {
+            "eventType": "call_complete",
+            "timestamp": "2026-03-31T22:05:00Z",
+            "customerId": "cust-123",
+            "eventDetails": {
+                "callId": "call-001",
+                "direction": "inbound",
+                "fromNumber": "+15551234567",
+                "toNumber": "+15559876543",
+                "user": {"id": "ext-100", "email": "test@test.com"},
+                "callDurationInSeconds": 120,
+                "missedCall": False,
+                "outcome": "Connected",
+            },
+        }
+        body = json.dumps(payload).encode("utf-8")
+        signature = _sign(body)
+
+        response = webhook_client.post(
+            "/webhooks/cloudcall",
+            content=body,
+            headers={"x-cloudcall-sig": signature, "Content-Type": "application/json"},
+        )
+        assert response.status_code == 200
+        assert "not handled" in response.json().get("detail", "")
+
+    def test_sms_event_ignored(self, webhook_client):
+        payload = {
+            "eventType": "sms",
+            "timestamp": "2026-03-31T22:00:00Z",
+            "customerId": "cust-123",
+            "eventDetails": {"message": "Hello"},
         }
         body = json.dumps(payload).encode("utf-8")
         signature = _sign(body)
@@ -185,6 +268,61 @@ class TestCloudCallWebhook:
         recs = cloudcall_db.get_cloudcall_recordings(user_id=user_id, hours=1)
         assert len(recs) == 1
         assert recs[0]["app_user_id"] == user_id
+
+    def test_timestamp_from_envelope(self, webhook_client):
+        """The call_timestamp should use the envelope timestamp field."""
+        payload = _make_recording_event({"callId": "call-ts-test"})
+        payload["timestamp"] = "2026-03-31T15:30:00Z"
+        body = json.dumps(payload).encode("utf-8")
+        signature = _sign(body)
+
+        response = webhook_client.post(
+            "/webhooks/cloudcall",
+            content=body,
+            headers={"x-cloudcall-sig": signature, "Content-Type": "application/json"},
+        )
+        assert response.status_code == 200
+
+        import cloudcall_db
+        recs = cloudcall_db.get_cloudcall_recordings(user_id=None, hours=24)
+        found = [r for r in recs if r["cloudcall_recording_id"] == "call-ts-test"]
+        assert len(found) == 1
+        assert found[0]["call_timestamp"] == "2026-03-31T15:30:00Z"
+
+
+class TestCloudCallWebhookFlatFormat:
+    """Tests using the flat (legacy) format for backward compatibility."""
+
+    def test_flat_format_recording(self, webhook_client):
+        payload = _make_flat_recording_event({"callId": "call-flat-001"})
+        body = json.dumps(payload).encode("utf-8")
+        signature = _sign(body)
+
+        response = webhook_client.post(
+            "/webhooks/cloudcall",
+            content=body,
+            headers={"x-cloudcall-sig": signature, "Content-Type": "application/json"},
+        )
+        assert response.status_code == 200
+        assert response.json()["recordings_inserted"] == 1
+
+    def test_flat_format_non_recording(self, webhook_client):
+        """Flat payloads without recordings key should be ignored."""
+        payload = {
+            "callId": "call-start-001",
+            "user": {"id": "ext-100", "email": "test@test.com"},
+            "status": "ringing",
+        }
+        body = json.dumps(payload).encode("utf-8")
+        signature = _sign(body)
+
+        response = webhook_client.post(
+            "/webhooks/cloudcall",
+            content=body,
+            headers={"x-cloudcall-sig": signature, "Content-Type": "application/json"},
+        )
+        assert response.status_code == 200
+        assert "not handled" in response.json().get("detail", "")
 
 
 class TestNoSigningKeyConfigured:
