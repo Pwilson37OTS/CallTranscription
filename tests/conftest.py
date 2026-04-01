@@ -27,12 +27,24 @@ def tmp_db(tmp_path, monkeypatch):
     (tmp_path / "uploads").mkdir(exist_ok=True)
     (tmp_path / "converted").mkdir(exist_ok=True)
 
+    # CloudCall directories
+    cc_downloads = tmp_path / "cloudcall_downloads"
+    cc_downloads.mkdir(exist_ok=True)
+    monkeypatch.setattr("cloudcall_config.CLOUDCALL_DOWNLOAD_DIR", cc_downloads)
+
     # Re-import db to pick up patched DB_PATH
     import db
     import importlib
     importlib.reload(db)
 
     db.init_db()
+
+    # Also init CloudCall tables so CloudCall tests work with shared fixture
+    import cloudcall_db
+    import importlib as _il
+    _il.reload(cloudcall_db)
+    cloudcall_db.init_cloudcall_tables()
+
     return db_file
 
 

@@ -14,15 +14,24 @@ def ffmpeg_available() -> bool:
     return shutil.which("ffmpeg") is not None
 
 
-def convert_audio_to_wav(input_path: Path) -> Path:
+def convert_file_to_wav(input_path: Path, allowed_source_dir: Path) -> Path:
+    """Convert any audio file to mono 16kHz WAV using ffmpeg.
+
+    Args:
+        input_path: Path to the source audio file.
+        allowed_source_dir: Directory the input_path must reside in (path traversal guard).
+
+    Returns:
+        Path to the converted WAV file in CONVERTED_DIR.
+    """
     if not ffmpeg_available():
         raise RuntimeError(
             "ffmpeg is not installed or not on PATH. Install ffmpeg first so the app can convert recordings to WAV automatically."
         )
 
-    # Validate input path is within UPLOAD_DIR to prevent path traversal
+    # Validate input path is within allowed_source_dir to prevent path traversal
     resolved = input_path.resolve()
-    if not str(resolved).startswith(str(UPLOAD_DIR.resolve())):
+    if not str(resolved).startswith(str(allowed_source_dir.resolve())):
         raise ValueError("Invalid file path.")
 
     output_path = CONVERTED_DIR / f"{input_path.stem}.wav"
@@ -40,6 +49,11 @@ def convert_audio_to_wav(input_path: Path) -> Path:
         raise RuntimeError("ffmpeg conversion failed: WAV file was not created.")
 
     return output_path
+
+
+def convert_audio_to_wav(input_path: Path) -> Path:
+    """Convert an uploaded audio file to WAV. Wrapper for backward compatibility."""
+    return convert_file_to_wav(input_path, UPLOAD_DIR)
 
 
 def save_uploaded_file(uploaded_file) -> Dict[str, Any]:

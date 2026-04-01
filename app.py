@@ -21,6 +21,7 @@ from auth import (
 from db import update_user
 from logging_config import logger
 from storage import storage
+from cloudcall_config import CLOUDCALL_ENABLED
 
 # ============================================================
 # Recruiter Call Review Tool
@@ -38,6 +39,10 @@ st.markdown(APP_CSS, unsafe_allow_html=True)
 
 init_db()
 ensure_admin_exists()
+
+if CLOUDCALL_ENABLED:
+    from cloudcall_db import init_cloudcall_tables
+    init_cloudcall_tables()
 
 
 # --- Rate limiting (in-memory, per-user, per-hour) ---
@@ -152,15 +157,21 @@ with hero_right:
         unsafe_allow_html=True,
     )
 
-# Build tabs — admin gets an extra tab
+# Build tabs — conditionally include CloudCall and Admin tabs
 tab_names = ["Call Queue", "Upload New Recording"]
+if CLOUDCALL_ENABLED:
+    tab_names.append("CloudCall Recordings")
 if user_is_admin:
     tab_names.append("Admin")
 
 tabs = st.tabs(tab_names)
 queue_tab = tabs[0]
 upload_tab = tabs[1]
-admin_tab = tabs[2] if user_is_admin else None
+_tab_idx = 2
+cloudcall_tab = tabs[_tab_idx] if CLOUDCALL_ENABLED else None
+if CLOUDCALL_ENABLED:
+    _tab_idx += 1
+admin_tab = tabs[_tab_idx] if user_is_admin else None
 
 # -----------------------------
 # Upload tab
@@ -556,6 +567,212 @@ with queue_tab:
 
 
 # -----------------------------
+# CloudCall Recordings tab
+# -----------------------------
+if cloudcall_tab is not None:
+    with cloudcall_tab:
+        from cloudcall_db import (
+            get_cloudcall_recordings,
+            get_cloudcall_recording,
+            update_cloudcall_recording,
+        )
+        from cloudcall_service import import_recording_to_pipeline, maybe_cleanup_expired
+
+        # Run opportunistic cleanup
+        maybe_cleanup_expired()
+
+        st.subheader("CloudCall Recordings (Last 48 Hours)")
+
+        # Status filter
+        status_filter = st.selectbox(
+            "Filter by status",
+            options=["All", "Available", "Imported", "Error"],
+            index=0,
+            key="cc_status_filter",
+        )
+
+        cc_recordings = get_cloudcall_recordings(user_id=query_user_id, hours=48)
+
+        # Apply status filter
+        if status_filter != "All":
+            filter_val = status_filter.lower()
+            cc_recordings = [r for r in cc_recordings if r["status"] == filter_val]
+
+        if not cc_recordings:
+            st.info("No CloudCall recordings in the last 48 hours.")
+        else:
+            # Display recordings with checkboxes for selection
+            selected_ids = []
+            for rec in cc_recordings:
+                rec_id = rec["id"]
+                col_check, col_time, col_from, col_to, col_dur, col_dir, col_status = st.columns(
+                    [0.5, 2, 2, 2, 1, 1, 1.5]
+                )
+
+                with col_check:
+                    if rec["status"] == "available":
+                        if st.checkbox("", key=f"cc_sel_{rec_id}", label_visibility="collapsed"):
+                            selected_ids.append(rec_id)
+
+                with col_time:
+                    try:
+                        ts = datetime.fromisoformat(rec["call_timestamp"])
+                        st.write(ts.strftime("%b %d %I:%M %p"))
+                    except Exception:
+                        st.write(rec["call_timestamp"][:16])
+
+                with col_from:
+                    st.write(rec["caller_number"] or "—")
+
+                with col_to:
+                    st.write(rec["callee_number"] or "—")
+
+                with col_dur:
+                    dur = rec["call_duration_seconds"] or 0
+                    st.write(f"{dur // 60}:{dur % 60:02d}")
+
+                with col_dir:
+                    st.write(rec["direction"] or "—")
+
+                with col_status:
+                    status = rec["status"]
+                    if status == "available":
+                        st.write("Available")
+                    elif status == "imported":
+                        st.write(f"Imported (#{rec['imported_call_id']})")
+                    elif status == "importing":
+                        st.write("Importing...")
+                    elif status == "error":
+                        st.write("Error")
+
+                # Show error details in expander
+                if rec["status"] == "error" and rec["error_message"]:
+                    with st.expander(f"Error details — Recording #{rec_id}"):
+                        st.error(rec["error_message"])
+
+            # Import actions
+            if selected_ids:
+                st.markdown("---")
+                st.write(f"**{len(selected_ids)} recording(s) selected**")
+
+                import_col1, import_col2 = st.columns(2)
+                with import_col1:
+                    import_call_type = st.selectbox(
+                        "Call Type for Import",
+                        options=list(CALL_TYPE_CONFIG.keys()),
+                        format_func=lambda k: CALL_TYPE_CONFIG[k]["label"],
+                        index=0,
+                        key="cc_import_call_type",
+                    )
+                with import_col2:
+                    import_subject = st.text_input(
+                        "Candidate / Subject Name (optional)",
+                        key="cc_import_subject",
+                    )
+
+                btn_col1, btn_col2, btn_col3 = st.columns(3)
+                with btn_col1:
+                    do_import = st.button("Import Only", key="cc_import_only")
+                with btn_col2:
+                    do_import_transcribe = st.button("Import & Transcribe", key="cc_import_transcribe")
+                with btn_col3:
+                    do_full_pipeline = st.button("Full Pipeline", key="cc_full_pipeline")
+
+                if do_import or do_import_transcribe or do_full_pipeline:
+                    success_count = 0
+                    error_count = 0
+                    for sel_id in selected_ids:
+                        try:
+                            rec_data = get_cloudcall_recording(sel_id)
+                            if not rec_data:
+                                continue
+
+                            metadata = {
+                                "recruiter_name": current_user["display_name"],
+                                "subject_name": import_subject,
+                                "company_name": "",
+                                "notes": f"Imported from CloudCall. Direction: {rec_data['direction'] or 'unknown'}",
+                            }
+
+                            with st.spinner(f"Importing recording #{sel_id}..."):
+                                new_call_id = import_recording_to_pipeline(
+                                    sel_id, current_user_id, import_call_type, metadata
+                                )
+
+                            # Optionally transcribe
+                            if do_import_transcribe or do_full_pipeline:
+                                if _check_rate_limit(current_user_id):
+                                    call = get_call(new_call_id, user_id=query_user_id)
+                                    if call:
+                                        audio_path = storage.resolve(call["stored_path"])
+                                        with st.spinner(f"Transcribing call #{new_call_id}..."):
+                                            transcript_text = transcribe_audio(
+                                                str(audio_path), model=transcription_model
+                                            )
+                                            update_call(
+                                                new_call_id,
+                                                transcript_text=transcript_text,
+                                                status="transcribed",
+                                                transcription_model=transcription_model,
+                                            )
+                                        _record_api_call(current_user_id)
+                                        insert_api_usage({
+                                            "user_id": current_user_id,
+                                            "call_id": new_call_id,
+                                            "operation": "transcription",
+                                            "model": transcription_model,
+                                            "estimated_cost_cents": 0,
+                                            "created_at": datetime.utcnow().isoformat(),
+                                        })
+
+                                        # Optionally summarize
+                                        if do_full_pipeline and _check_rate_limit(current_user_id):
+                                            with st.spinner(f"Summarizing call #{new_call_id}..."):
+                                                summary_text = summarize_transcript(
+                                                    transcript_text=transcript_text,
+                                                    call_type=import_call_type,
+                                                    metadata=metadata,
+                                                    model=summary_model,
+                                                )
+                                                update_call(
+                                                    new_call_id,
+                                                    summary_text=summary_text,
+                                                    status="summarized",
+                                                    summary_model=summary_model,
+                                                )
+                                            _record_api_call(current_user_id)
+                                            insert_api_usage({
+                                                "user_id": current_user_id,
+                                                "call_id": new_call_id,
+                                                "operation": "summarization",
+                                                "model": summary_model,
+                                                "estimated_cost_cents": 0,
+                                                "created_at": datetime.utcnow().isoformat(),
+                                            })
+                                else:
+                                    st.warning(f"Rate limit reached. Call #{new_call_id} imported but not transcribed.")
+
+                            success_count += 1
+                            logger.info(
+                                "CloudCall import: user_id=%d recording_id=%d call_id=%d",
+                                current_user_id, sel_id, new_call_id,
+                            )
+                        except Exception as e:
+                            error_count += 1
+                            logger.error(
+                                "CloudCall import failed: user_id=%d recording_id=%d error=%s",
+                                current_user_id, sel_id, e,
+                            )
+                            st.error(f"Failed to import recording #{sel_id}: {e}")
+
+                    if success_count > 0:
+                        st.success(f"Successfully imported {success_count} recording(s). Check the Call Queue tab.")
+                    if error_count > 0:
+                        st.warning(f"{error_count} recording(s) failed to import.")
+                    st.rerun()
+
+
+# -----------------------------
 # Admin tab
 # -----------------------------
 if admin_tab is not None:
@@ -633,3 +850,67 @@ if admin_tab is not None:
             st.dataframe(df, use_container_width=True, hide_index=True)
         else:
             st.info("No API usage recorded yet.")
+
+        # --- CloudCall User Mappings (only when integration is enabled) ---
+        if CLOUDCALL_ENABLED:
+            from cloudcall_db import (
+                get_all_cloudcall_user_mappings,
+                upsert_cloudcall_user_mapping,
+                delete_cloudcall_user_mapping,
+                get_unmapped_cloudcall_user_ids,
+            )
+
+            st.markdown("---")
+            st.markdown("### CloudCall User Mappings")
+            st.caption("Map CloudCall user IDs / extensions to app users so recordings route to the right recruiter.")
+
+            mappings = get_all_cloudcall_user_mappings()
+            if mappings:
+                for m in mappings:
+                    mc1, mc2, mc3, mc4 = st.columns([2, 2, 3, 1])
+                    with mc1:
+                        st.write(m["cloudcall_user_id"])
+                    with mc2:
+                        st.write(m["cloudcall_display_name"] or "—")
+                    with mc3:
+                        st.write(f"{m['app_user_name']} ({m['app_user_email']})")
+                    with mc4:
+                        if st.button("Delete", key=f"del_ccmap_{m['id']}"):
+                            delete_cloudcall_user_mapping(m["id"])
+                            st.rerun()
+            else:
+                st.info("No CloudCall user mappings configured yet.")
+
+            # Unmapped recordings alert
+            unmapped_ids = get_unmapped_cloudcall_user_ids()
+            if unmapped_ids:
+                st.warning(
+                    f"**{len(unmapped_ids)} unmapped CloudCall user ID(s)** have recordings without a linked app user: "
+                    f"{', '.join(unmapped_ids)}"
+                )
+
+            # Add new mapping form
+            st.markdown("#### Add New Mapping")
+            with st.form("add_cc_mapping"):
+                all_users = get_all_users()
+                cc_user_id = st.text_input("CloudCall User ID / Extension")
+                cc_display_name = st.text_input("CloudCall Display Name (optional)")
+                app_user_options = {f"{u['display_name']} ({u['email']})": u["id"] for u in all_users}
+                selected_app_user_label = st.selectbox(
+                    "App User",
+                    options=list(app_user_options.keys()),
+                )
+                mapping_submitted = st.form_submit_button("Save Mapping")
+
+                if mapping_submitted:
+                    if not cc_user_id:
+                        st.error("CloudCall User ID is required.")
+                    else:
+                        selected_app_user_id = app_user_options[selected_app_user_label]
+                        upsert_cloudcall_user_mapping(
+                            cc_user_id.strip(),
+                            selected_app_user_id,
+                            cc_display_name.strip(),
+                        )
+                        st.success(f"Mapping saved: {cc_user_id} -> {selected_app_user_label}")
+                        st.rerun()

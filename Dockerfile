@@ -1,8 +1,8 @@
 FROM python:3.12-slim
 
-# Install ffmpeg for audio conversion
+# Install ffmpeg and supervisor for multi-process management
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg && \
+    apt-get install -y --no-install-recommends ffmpeg supervisor curl && \
     rm -rf /var/lib/apt/lists/*
 
 WORKDIR /app
@@ -15,10 +15,10 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Create data directories
-RUN mkdir -p data/uploads data/converted data/logs
+RUN mkdir -p data/uploads data/converted data/logs data/cloudcall_downloads
 
-EXPOSE 8501
+EXPOSE 8501 8080
 
 HEALTHCHECK CMD curl --fail http://localhost:8501/_stcore/health || exit 1
 
-ENTRYPOINT ["streamlit", "run", "app.py", "--server.port=8501", "--server.address=0.0.0.0"]
+ENTRYPOINT ["supervisord", "-c", "supervisord.conf"]
