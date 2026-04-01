@@ -25,6 +25,11 @@ CLOUDCALL_WEBHOOK_SIGNING_KEY = os.getenv("CLOUDCALL_WEBHOOK_SIGNING_KEY", "")
 # Recording retention (hours) — recordings older than this are auto-purged
 CLOUDCALL_RECORDING_RETENTION_HOURS = int(os.getenv("CLOUDCALL_RECORDING_RETENTION_HOURS", "48"))
 
+# Polling settings
+CLOUDCALL_POLL_INTERVAL_MINUTES = int(os.getenv("CLOUDCALL_POLL_INTERVAL_MINUTES", "5"))
+CLOUDCALL_POLL_START_HOUR_CT = int(os.getenv("CLOUDCALL_POLL_START_HOUR_CT", "6"))   # 6 AM Central
+CLOUDCALL_POLL_END_HOUR_CT = int(os.getenv("CLOUDCALL_POLL_END_HOUR_CT", "18"))      # 6 PM Central
+
 # Feature flag: enabled when refresh token is configured
 CLOUDCALL_ENABLED = bool(CLOUDCALL_REFRESH_TOKEN)
 
