@@ -44,26 +44,80 @@ logger = logging.getLogger("calltranscription.cloudcall")
 _last_cleanup_time: float = 0.0
 _CLEANUP_INTERVAL_SECONDS = 900
 
-# In-memory token cache
+# In-memory token cache (per-process)
 _access_token: str = ""
 _access_token_expires_at: float = 0.0
-_current_refresh_token: str = CLOUDCALL_REFRESH_TOKEN
+
+# ---------------------------------------------------------------------------
+# Token persistence: shared across poller + Streamlit via SQLite
+# ---------------------------------------------------------------------------
+import json
+import sqlite3
+from config import DB_PATH
+
+
+def _get_stored_tokens() -> Dict[str, Any]:
+    """Read the current tokens from the DB (shared across processes)."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS cloudcall_tokens ("
+            "  id INTEGER PRIMARY KEY CHECK (id = 1),"
+            "  access_token TEXT, refresh_token TEXT,"
+            "  expires_at REAL"
+            ")"
+        )
+        row = conn.execute("SELECT access_token, refresh_token, expires_at FROM cloudcall_tokens WHERE id = 1").fetchone()
+        if row:
+            return {"access_token": row[0] or "", "refresh_token": row[1] or "", "expires_at": row[2] or 0.0}
+        return {"access_token": "", "refresh_token": "", "expires_at": 0.0}
+    finally:
+        conn.close()
+
+
+def _store_tokens(access_token: str, refresh_token: str, expires_at: float):
+    """Persist tokens to DB so all processes share them."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS cloudcall_tokens ("
+            "  id INTEGER PRIMARY KEY CHECK (id = 1),"
+            "  access_token TEXT, refresh_token TEXT,"
+            "  expires_at REAL"
+            ")"
+        )
+        conn.execute(
+            "INSERT OR REPLACE INTO cloudcall_tokens (id, access_token, refresh_token, expires_at) "
+            "VALUES (1, ?, ?, ?)",
+            (access_token, refresh_token, expires_at),
+        )
+        conn.commit()
+    finally:
+        conn.close()
 
 
 def get_access_token() -> str:
     """Get a valid CloudCall access token, refreshing if needed.
 
-    The refresh token flow returns a new refresh_token each time,
-    which we store in memory for subsequent calls. The initial
-    refresh_token comes from the CLOUDCALL_REFRESH_TOKEN env var.
+    Tokens are shared across processes (poller + Streamlit) via SQLite.
+    The refresh token is single-use: each refresh returns a new one.
     """
-    global _access_token, _access_token_expires_at, _current_refresh_token
+    global _access_token, _access_token_expires_at
 
-    # Return cached token if still valid (with 5 min buffer)
+    # Return in-memory cached token if still valid (with 5 min buffer)
     if _access_token and time() < (_access_token_expires_at - 300):
         return _access_token
 
-    if not _current_refresh_token:
+    # Check DB for a token another process may have refreshed
+    stored = _get_stored_tokens()
+    if stored["access_token"] and time() < (stored["expires_at"] - 300):
+        _access_token = stored["access_token"]
+        _access_token_expires_at = stored["expires_at"]
+        return _access_token
+
+    # Need to refresh — use stored refresh token or env var as fallback
+    current_refresh = stored["refresh_token"] or CLOUDCALL_REFRESH_TOKEN
+    if not current_refresh:
         raise RuntimeError("CLOUDCALL_REFRESH_TOKEN is not configured")
 
     with httpx.Client(timeout=30.0) as client:
@@ -72,7 +126,7 @@ def get_access_token() -> str:
             data={
                 "client_id": CLOUDCALL_CLIENT_ID,
                 "grant_type": "refresh_token",
-                "refresh_token": _current_refresh_token,
+                "refresh_token": current_refresh,
             },
         )
         response.raise_for_status()
@@ -80,7 +134,10 @@ def get_access_token() -> str:
     token_data = response.json()
     _access_token = token_data["access_token"]
     _access_token_expires_at = time() + token_data.get("expires_in", 86400)
-    _current_refresh_token = token_data.get("refresh_token", _current_refresh_token)
+    new_refresh = token_data.get("refresh_token", current_refresh)
+
+    # Persist so other processes can use the new tokens
+    _store_tokens(_access_token, new_refresh, _access_token_expires_at)
 
     logger.info("CloudCall access token refreshed, expires in %ds", token_data.get("expires_in", 0))
     return _access_token
