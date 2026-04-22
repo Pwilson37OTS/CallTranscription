@@ -232,9 +232,18 @@ def import_recording_to_pipeline(
 
     download_path = None
     try:
-        # Download
+        # CloudCall recording URLs are S3 pre-signed URLs valid for ~10 min.
+        # Always fetch a fresh URL at import time — the one stored at poll time
+        # is almost certainly expired by the time a user clicks Import.
+        fresh_url = get_recording_url(recording["cloudcall_recording_id"])
+        if not fresh_url:
+            raise RuntimeError(
+                "Recording URL no longer available from CloudCall — "
+                "the call may have been deleted or retention expired."
+            )
+
         download_path = download_recording(
-            recording["recording_url"],
+            fresh_url,
             recording["cloudcall_recording_id"],
         )
 
