@@ -636,7 +636,7 @@ if cloudcall_tab is not None:
 
                 with col_check:
                     if rec["status"] == "available":
-                        if st.checkbox("", key=f"cc_sel_{rec_id}", label_visibility="collapsed"):
+                        if st.checkbox("Select recording", key=f"cc_sel_{rec_id}", label_visibility="collapsed"):
                             selected_ids.append(rec_id)
 
                 with col_time:
