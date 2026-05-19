@@ -120,18 +120,38 @@ def get_access_token() -> str:
     if not current_refresh:
         raise RuntimeError("CLOUDCALL_REFRESH_TOKEN is not configured")
 
-    with httpx.Client(timeout=30.0) as client:
-        response = client.post(
-            CLOUDCALL_AUTH_URL,
-            data={
-                "client_id": CLOUDCALL_CLIENT_ID,
-                "grant_type": "refresh_token",
-                "refresh_token": current_refresh,
-            },
-        )
-        response.raise_for_status()
+    def _do_refresh(refresh_token: str, source: str) -> Dict[str, Any]:
+        with httpx.Client(timeout=30.0) as client:
+            r = client.post(
+                CLOUDCALL_AUTH_URL,
+                data={
+                    "client_id": CLOUDCALL_CLIENT_ID,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                },
+            )
+        if r.status_code != 200:
+            body = (r.text or "")[:500]
+            raise RuntimeError(
+                f"CloudCall token refresh rejected (source={source}, status={r.status_code}): {body}"
+            )
+        return r.json()
 
-    token_data = response.json()
+    source = "stored" if stored["refresh_token"] else "env"
+    try:
+        token_data = _do_refresh(current_refresh, source)
+    except RuntimeError as e:
+        # Common case: the DB-stored token got rotated/invalidated but the
+        # original env-var bootstrap is still valid. Retry once with that.
+        if (
+            source == "stored"
+            and CLOUDCALL_REFRESH_TOKEN
+            and CLOUDCALL_REFRESH_TOKEN != current_refresh
+        ):
+            logger.warning("Stored refresh token rejected; retrying with env-var bootstrap. Original error: %s", e)
+            token_data = _do_refresh(CLOUDCALL_REFRESH_TOKEN, "env-fallback")
+        else:
+            raise
     _access_token = token_data["access_token"]
     _access_token_expires_at = time() + token_data.get("expires_in", 86400)
     new_refresh = token_data.get("refresh_token", current_refresh)
@@ -411,7 +431,7 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
         calls = fetch_call_logs(from_dt, to_dt)
     except Exception as e:
         logger.error("Failed to fetch call logs: %s", e)
-        return 0
+        raise
 
     if not calls:
         logger.info("No recorded calls found in polling window")
@@ -451,8 +471,9 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
                 app_user_id = mapping["app_user_id"]
 
         # Insert (idempotent — duplicates are silently skipped)
+        recording_db_id = None
         try:
-            insert_cloudcall_recording({
+            recording_db_id = insert_cloudcall_recording({
                 "cloudcall_recording_id": call_data_id,
                 "cloudcall_user_id": cloudcall_user_id,
                 "app_user_id": app_user_id,
@@ -476,9 +497,31 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
             )
         except Exception as e:
             if "UNIQUE constraint" in str(e):
-                pass  # Already exists, expected for overlap window
+                continue  # Already exists, expected for overlap window
             else:
                 logger.error("Failed to insert polled recording %s: %s", call_data_id, e)
+                continue
+
+        # Auto-import: if the recording is mapped to an app user, download +
+        # convert + insert into the calls table now so it shows up immediately
+        # in that recruiter's view without a manual import click.
+        if recording_db_id and app_user_id:
+            try:
+                import_recording_to_pipeline(
+                    cloudcall_recording_db_id=recording_db_id,
+                    user_id=app_user_id,
+                    metadata={
+                        "recruiter_name": call.get("user_name", ""),
+                        "subject_name": call.get("contact_name", ""),
+                    },
+                )
+            except Exception as e:
+                # Don't fail the whole poll — leave the recording at 'error'
+                # status (set by import_recording_to_pipeline) for admin review.
+                logger.warning(
+                    "Auto-import failed for recording %s (db_id=%d): %s",
+                    call_data_id, recording_db_id, e,
+                )
 
     logger.info("Polling complete: %d new recordings inserted from %d calls", inserted, len(calls))
 

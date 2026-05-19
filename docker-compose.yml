@@ -1,6 +1,8 @@
 services:
   app:
     build: .
+    image: calltranscription:latest
+    container_name: calltranscription
     ports:
       - "8080:8080"
     env_file:
@@ -8,6 +10,19 @@ services:
     volumes:
       - app-data:/app/data
     restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+    # Bound the Docker log driver so /var/lib/docker/containers doesn't grow
+    # without limit. Five 10MB files = 50MB cap per container.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
 
 volumes:
   app-data:

@@ -38,6 +38,14 @@ APP_CSS = """
   color: white !important;
 }
 
+/* Sidebar form fields keep light backgrounds, so force dark text inside them */
+[data-testid="stSidebar"] input,
+[data-testid="stSidebar"] textarea,
+[data-testid="stSidebar"] [data-baseweb="select"] *,
+[data-testid="stSidebar"] [data-baseweb="popover"] * {
+  color: var(--brand-navy) !important;
+}
+
 [data-testid="stHeader"] {
   background: rgba(255,255,255,0.55);
   backdrop-filter: blur(8px);

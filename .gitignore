@@ -29,3 +29,8 @@ venv/
 # OS
 .DS_Store
 Thumbs.db
+
+# Local dev tooling
+.claude/
+.coverage
+run_local.bat

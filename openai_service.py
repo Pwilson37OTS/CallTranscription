@@ -1,10 +1,8 @@
 import os
-import json
-from typing import Dict, Any, List
+from typing import Dict, Any
 
 from openai import OpenAI
 
-from prompts import CALL_TYPE_CONFIG
 from logging_config import logger
 
 
@@ -29,53 +27,58 @@ def transcribe_audio(file_path: str, model: str = "gpt-4o-transcribe") -> str:
     return transcript.text
 
 
-def build_summary_messages(transcript_text: str, call_type: str, metadata: Dict[str, Any]) -> List[Dict[str, str]]:
-    cfg = CALL_TYPE_CONFIG[call_type]
-
-    metadata_block = json.dumps(
-        {
-            "recruiter_name": metadata.get("recruiter_name"),
-            "subject_name": metadata.get("subject_name"),
-            "company_name": metadata.get("company_name"),
-            "notes": metadata.get("notes"),
-            "call_type": call_type,
-            "call_type_label": cfg["label"],
-        },
-        indent=2,
-    )
-
-    user_prompt = (
-        "Use the transcript and metadata below to generate the ATS-ready note.\n\n"
-        f"Metadata:\n{metadata_block}\n\n"
-        f"Transcript:\n{transcript_text}"
-    )
-
-    return [
-        {"role": "system", "content": cfg["system_prompt"]},
-        {"role": "developer", "content": cfg["developer_prompt"]},
-        {"role": "user", "content": user_prompt},
-    ]
-
-
-def summarize_transcript(
+def diarize_transcript(
     transcript_text: str,
-    call_type: str,
     metadata: Dict[str, Any],
     model: str = "gpt-4.1",
 ) -> str:
-    logger.info("Summarization started: model=%s call_type=%s", model, call_type)
+    """Label speaker turns on a raw transcript using textual context.
+
+    OpenAI's transcription API does not perform acoustic diarization.
+    This pass uses an LLM to infer speaker boundaries from conversational
+    cues and the call metadata (recruiter name, subject name).
+    """
+    logger.info("Diarization started: model=%s chars=%d", model, len(transcript_text))
+
+    recruiter = (metadata.get("recruiter_name") or "").strip() or "Recruiter"
+    subject = (metadata.get("subject_name") or "").strip() or "Contact"
+
+    system_prompt = (
+        "You are a transcript editor for a staffing recruiter tool. The user will give you "
+        "a raw, single-stream transcript of a phone or video call. Your job is to label "
+        "each speaker turn and break the transcript into readable lines. "
+        "Preserve every word the speakers actually said — do not paraphrase, summarize, "
+        "translate, correct grammar, or remove filler words. Add light punctuation only "
+        "where it improves readability."
+    )
+
+    user_prompt = (
+        "Known speakers (use these names when you can confidently identify them):\n"
+        f"  - {recruiter} — the recruiter on the call\n"
+        f"  - {subject} — the contact / candidate\n\n"
+        "Reformat the transcript below using these rules:\n"
+        "  1. Detect speaker turns from conversational context (questions vs. answers, "
+        "tone shifts, name mentions, etc.).\n"
+        "  2. Put each turn on its own line in the format: 'Name: spoken text'.\n"
+        "  3. Use the known speaker names above when you are reasonably confident. If "
+        "you cannot tell who is speaking, use 'Speaker 1', 'Speaker 2', etc. consistently.\n"
+        "  4. If a third party joins, label them as 'Speaker 3' or by name if it is stated "
+        "on the call.\n"
+        "  5. Do NOT paraphrase, summarize, or remove any spoken content. Every word from "
+        "the source transcript must appear in your output.\n"
+        "  6. Do not add commentary, headers, or explanations — return only the labeled "
+        "transcript.\n\n"
+        f"Transcript:\n{transcript_text}"
+    )
+
     client = get_openai_client()
-    messages = build_summary_messages(transcript_text, call_type, metadata)
-
-    normalized = [
-        {**m, "role": "system"} if m["role"] == "developer" else m
-        for m in messages
-    ]
-
     response = client.chat.completions.create(
         model=model,
-        messages=normalized,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
     )
     result = response.choices[0].message.content.strip()
-    logger.info("Summarization complete: model=%s chars=%d", model, len(result))
+    logger.info("Diarization complete: model=%s chars=%d", model, len(result))
     return result

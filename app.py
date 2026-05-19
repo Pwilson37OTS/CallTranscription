@@ -7,18 +7,16 @@ import streamlit as st
 
 from config import LOGO_PATH, RATE_LIMIT_PER_HOUR
 from styles import APP_CSS
-from prompts import CALL_TYPE_CONFIG
 from db import (
     init_db, insert_call, update_call, get_all_calls, get_call,
-    insert_api_usage, get_all_users, get_usage_summary,
+    insert_api_usage, get_all_users, get_usage_summary, update_user,
 )
-from openai_service import transcribe_audio, summarize_transcript
+from openai_service import transcribe_audio, diarize_transcript
 from file_service import save_uploaded_file, ffmpeg_available
 from auth import (
     authenticate, login, logout, get_current_user, is_admin,
     ensure_admin_exists, create_user,
 )
-from db import update_user
 from logging_config import logger
 from storage import storage
 from cloudcall_config import CLOUDCALL_ENABLED
@@ -40,10 +38,6 @@ st.markdown(APP_CSS, unsafe_allow_html=True)
 init_db()
 ensure_admin_exists()
 
-if CLOUDCALL_ENABLED:
-    from cloudcall_db import init_cloudcall_tables
-    init_cloudcall_tables()
-
 
 # --- Rate limiting (in-memory, per-user, per-hour) ---
 if "_rate_limits" not in st.session_state:
@@ -51,17 +45,19 @@ if "_rate_limits" not in st.session_state:
 
 
 def _check_rate_limit(user_id: int) -> bool:
-    """Return True if the user is within the rate limit, False if exceeded."""
     now = time()
     window = st.session_state._rate_limits[user_id]
-    # Purge entries older than 1 hour
     st.session_state._rate_limits[user_id] = [t for t in window if now - t < 3600]
     return len(st.session_state._rate_limits[user_id]) < RATE_LIMIT_PER_HOUR
 
 
 def _record_api_call(user_id: int):
-    """Record an API call timestamp for rate limiting."""
     st.session_state._rate_limits[user_id].append(time())
+
+
+# --- Defaults for the models (no longer user-selectable in the simplified UI) ---
+DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
+DEFAULT_DIARIZATION_MODEL = "gpt-4.1"
 
 
 # -----------------------------
@@ -104,13 +100,11 @@ if not st.session_state.get("authenticated"):
 current_user = get_current_user()
 current_user_id = current_user["id"]
 user_is_admin = is_admin()
-
-# For user-scoped queries: admin sees all (user_id=None), recruiter sees own
 query_user_id = None if user_is_admin else current_user_id
 
 
 # -----------------------------
-# Sidebar
+# Sidebar (minimal — user info + sign out only)
 # -----------------------------
 with st.sidebar:
     st.markdown(f"**{current_user['display_name']}**")
@@ -121,22 +115,6 @@ with st.sidebar:
         logger.info("Logout: user_id=%d", current_user_id)
         logout()
         st.rerun()
-
-    st.markdown("---")
-    st.header("Settings")
-    st.caption(f"ffmpeg detected: {'Yes' if ffmpeg_available() else 'No'}")
-
-    transcription_model = st.selectbox(
-        "Transcription Model",
-        options=["gpt-4o-transcribe", "gpt-4o-mini-transcribe", "whisper-1"],
-        index=0,
-    )
-
-    summary_model = st.selectbox(
-        "Summary Model",
-        options=["gpt-4.1", "gpt-4o", "gpt-4o-mini"],
-        index=0,
-    )
 
 
 # -----------------------------
@@ -151,108 +129,134 @@ with hero_right:
         """
         <div class="brand-hero">
             <h1>Recruiter Call Review Tool</h1>
-            <p>Upload audio, auto-convert to WAV, transcribe, generate dynamic call-type summaries, review, and copy ATS-ready notes.</p>
+            <p>Select a call, review the transcript, and submit it to Bullhorn as a note.</p>
         </div>
         """,
         unsafe_allow_html=True,
     )
 
-# Build tabs — conditionally include CloudCall and Admin tabs
-tab_names = ["Call Queue", "Upload New Recording"]
-if CLOUDCALL_ENABLED:
-    tab_names.append("CloudCall Recordings")
+
+# -----------------------------
+# Helper: ensure a call has a diarized transcript (auto-transcribe on demand)
+# -----------------------------
+def ensure_transcript(call) -> str:
+    """Return the diarized transcript for a call, generating it if needed."""
+    if call["transcript_text"]:
+        return call["transcript_text"]
+
+    if not _check_rate_limit(current_user_id):
+        raise RuntimeError(
+            f"Rate limit exceeded ({RATE_LIMIT_PER_HOUR} API calls/hour). Please wait."
+        )
+
+    audio_path = storage.resolve(call["stored_path"])
+    if not audio_path.exists():
+        raise FileNotFoundError("Audio file is missing from storage.")
+
+    logger.info("Auto-transcribe started: user_id=%d call_id=%d", current_user_id, call["id"])
+
+    with st.spinner("Transcribing audio..."):
+        raw_transcript = transcribe_audio(str(audio_path), model=DEFAULT_TRANSCRIPTION_MODEL)
+    _record_api_call(current_user_id)
+    insert_api_usage({
+        "user_id": current_user_id,
+        "call_id": call["id"],
+        "operation": "transcription",
+        "model": DEFAULT_TRANSCRIPTION_MODEL,
+        "estimated_cost_cents": 0,
+        "created_at": datetime.utcnow().isoformat(),
+    })
+
+    with st.spinner("Labeling speakers..."):
+        labeled = diarize_transcript(
+            transcript_text=raw_transcript,
+            metadata={
+                "recruiter_name": call["recruiter_name"],
+                "subject_name": call["subject_name"],
+            },
+            model=DEFAULT_DIARIZATION_MODEL,
+        )
+    _record_api_call(current_user_id)
+    insert_api_usage({
+        "user_id": current_user_id,
+        "call_id": call["id"],
+        "operation": "diarization",
+        "model": DEFAULT_DIARIZATION_MODEL,
+        "estimated_cost_cents": 0,
+        "created_at": datetime.utcnow().isoformat(),
+    })
+
+    update_call(
+        call["id"],
+        transcript_text=labeled,
+        status="transcribed",
+        transcription_model=DEFAULT_TRANSCRIPTION_MODEL,
+        summary_model=DEFAULT_DIARIZATION_MODEL,
+    )
+    logger.info("Auto-transcribe complete: user_id=%d call_id=%d", current_user_id, call["id"])
+    return labeled
+
+
+# -----------------------------
+# Tabs
+# -----------------------------
+tab_names = ["Calls", "Call Log"]
 if user_is_admin:
     tab_names.append("Admin")
 
 tabs = st.tabs(tab_names)
-queue_tab = tabs[0]
-upload_tab = tabs[1]
-_tab_idx = 2
-cloudcall_tab = tabs[_tab_idx] if CLOUDCALL_ENABLED else None
-if CLOUDCALL_ENABLED:
-    _tab_idx += 1
-admin_tab = tabs[_tab_idx] if user_is_admin else None
+calls_tab = tabs[0]
+log_tab = tabs[1]
+admin_tab = tabs[2] if user_is_admin else None
+
 
 # -----------------------------
-# Upload tab
+# Calls tab (main workflow)
 # -----------------------------
-with upload_tab:
-    st.subheader("Upload a New Recording")
-
-    with st.form("upload_form"):
-        uploaded_file = st.file_uploader(
-            "Audio file (extensions optional)",
-            type=None,
-            help="Files without extensions are accepted. The app will attempt to convert anything uploaded into WAV using ffmpeg.",
-        )
-
-        col1, col2 = st.columns(2)
-        with col1:
-            recruiter_name = st.text_input("Recruiter Name", value=current_user["display_name"])
-            subject_name = st.text_input("Candidate / Reference / Contact Name")
-        with col2:
-            company_name = st.text_input("Company / Client")
-            call_type = st.selectbox(
-                "Default Call Type",
-                options=list(CALL_TYPE_CONFIG.keys()),
-                format_func=lambda k: CALL_TYPE_CONFIG[k]["label"],
-                index=0,
-            )
-
-        notes = st.text_area("Internal Notes / Context", placeholder="Optional context to help the summary.")
-        submitted = st.form_submit_button("Save Recording")
-
-        if submitted:
-            if not uploaded_file:
-                st.error("Please upload an audio file.")
-            else:
+with calls_tab:
+    # Header row with refresh button (when CloudCall enabled)
+    if CLOUDCALL_ENABLED:
+        col_title, col_refresh = st.columns([4, 1])
+        with col_title:
+            st.subheader("Process a Call")
+        with col_refresh:
+            if st.button(
+                "Pull from CloudCall",
+                key="main_refresh",
+                help="Check CloudCall for any new recordings from the last 72 hours.",
+            ):
                 try:
-                    file_info = save_uploaded_file(uploaded_file)
-                    record = {
-                        "created_at": datetime.utcnow().isoformat(),
-                        **file_info,
-                        "recruiter_name": recruiter_name,
-                        "subject_name": subject_name,
-                        "company_name": company_name,
-                        "notes": notes,
-                        "call_type": call_type,
-                        "status": "uploaded",
-                        "transcript_text": None,
-                        "summary_text": None,
-                        "transcription_model": None,
-                        "summary_model": None,
-                        "user_id": current_user_id,
-                    }
-                    new_id = insert_call(record)
-                    logger.info("Upload: user_id=%d call_id=%d file=%s", current_user_id, new_id, file_info.get("original_filename", ""))
-                    st.success(f"Recording saved. Call ID: {new_id}")
+                    from cloudcall_service import poll_recent_recordings
+                    with st.spinner("Checking CloudCall for new recordings..."):
+                        n = poll_recent_recordings(lookback_minutes=72 * 60)
+                    if n > 0:
+                        st.success(f"Found {n} new recording(s).")
+                    else:
+                        st.info("No new recordings found.")
+                    logger.info("CloudCall refresh: user_id=%d inserted=%d", current_user_id, n)
+                    st.rerun()
                 except Exception as e:
-                    logger.error("Upload failed: user_id=%d error=%s", current_user_id, e)
-                    st.error(f"Upload failed: {e}")
-                    if not ffmpeg_available():
-                        st.info(
-                            "Install ffmpeg, then restart Streamlit. On Windows, the easiest route is: winget install Gyan.FFmpeg"
-                        )
+                    logger.error("CloudCall refresh failed: user_id=%d error=%s", current_user_id, e)
+                    st.error(f"Refresh failed: {e}")
+    else:
+        st.subheader("Process a Call")
 
-
-# -----------------------------
-# Queue tab
-# -----------------------------
-with queue_tab:
-    st.subheader("Call Queue")
     calls = get_all_calls(user_id=query_user_id)
 
     if not calls:
-        st.info("No calls saved yet. Upload a recording to get started.")
+        if CLOUDCALL_ENABLED:
+            st.info("No calls available yet. Click **Pull from CloudCall** above to fetch recent recordings.")
+        else:
+            st.info("No calls available yet.")
     else:
-
+        # Dropdown selector
         def _call_label(row) -> str:
-            candidate = row["subject_name"] or row["original_filename"]
-            call_type_label = CALL_TYPE_CONFIG.get(row["call_type"] or "", {}).get(
-                "label", row["call_type"] or ""
-            )
-            status = row["status"].replace("_", " ").title()
-            return f"#{row['id']} | {candidate} | {call_type_label} | {status}"
+            who = row["subject_name"] or row["original_filename"] or "Unknown"
+            try:
+                dt = datetime.fromisoformat(row["created_at"]).strftime("%b %d, %I:%M %p")
+            except Exception:
+                dt = (row["created_at"] or "")[:16]
+            return f"#{row['id']} | {who} | {dt}"
 
         options = {_call_label(row): row["id"] for row in calls}
         selected_label = st.selectbox("Select a call", list(options.keys()))
@@ -260,566 +264,118 @@ with queue_tab:
         call = get_call(selected_id, user_id=query_user_id)
 
         if call:
-            left, right = st.columns([1, 1])
+            left, right = st.columns([1, 2])
 
             with left:
                 st.markdown("### Call Details")
-                st.write(f"**Call ID:** {call['id']}")
                 try:
-                    created_dt = datetime.fromisoformat(call["created_at"])
-                    friendly_date = created_dt.strftime("%b %d, %Y at %I:%M %p UTC")
+                    dt = datetime.fromisoformat(call["created_at"]).strftime("%b %d, %Y at %I:%M %p UTC")
                 except Exception:
-                    friendly_date = call["created_at"]
-                st.write(f"**Uploaded:** {friendly_date}")
-                st.write(f"**Original File:** {call['original_filename']}")
-
-                status_text = call["status"].replace("_", " ").title()
-                st.write(f"**Status:** {status_text}")
-
-                edit_recruiter_name = st.text_input(
-                    "Recruiter Name",
-                    value=call["recruiter_name"] or "",
-                    key=f"recruiter_{call['id']}",
-                )
-                edit_subject_name = st.text_input(
-                    "Candidate / Reference / Contact Name",
-                    value=call["subject_name"] or "",
-                    key=f"subject_{call['id']}",
-                )
-                edit_company_name = st.text_input(
-                    "Company / Client",
-                    value=call["company_name"] or "",
-                    key=f"company_{call['id']}",
-                )
-                edit_notes = st.text_area(
-                    "Internal Notes / Context",
-                    value=call["notes"] or "",
-                    key=f"notes_{call['id']}",
-                )
-                edit_call_type = st.selectbox(
-                    "Call Type",
-                    options=list(CALL_TYPE_CONFIG.keys()),
-                    format_func=lambda k: CALL_TYPE_CONFIG[k]["label"],
-                    index=(
-                        list(CALL_TYPE_CONFIG.keys()).index(call["call_type"])
-                        if call["call_type"] in CALL_TYPE_CONFIG
-                        else 0
-                    ),
-                    key=f"type_{call['id']}",
-                )
-
-                col_a, col_b = st.columns(2)
-                with col_a:
-                    if st.button("Save Metadata", key=f"save_meta_{call['id']}"):
-                        update_call(
-                            call["id"],
-                            recruiter_name=edit_recruiter_name,
-                            subject_name=edit_subject_name,
-                            company_name=edit_company_name,
-                            notes=edit_notes,
-                            call_type=edit_call_type,
-                        )
-                        st.success("Metadata saved.")
-                        st.rerun()
+                    dt = call["created_at"]
+                st.write(f"**Date:** {dt}")
+                st.write(f"**Contact:** {call['subject_name'] or '—'}")
+                st.write(f"**Recruiter:** {call['recruiter_name'] or '—'}")
 
                 audio_path = storage.resolve(call["stored_path"])
-
-                with col_b:
-                    if audio_path.exists():
-                        with open(audio_path, "rb") as audio_bytes:
-                            st.download_button(
-                                "Download Audio",
-                                data=audio_bytes,
-                                file_name=call["original_filename"],
-                                mime=call["mime_type"] or "application/octet-stream",
-                                key=f"download_{call['id']}",
-                            )
-
                 if audio_path.exists():
                     st.audio(str(audio_path))
+                else:
+                    st.warning("Audio file not found in storage.")
 
                 st.markdown("---")
-                st.markdown("### Actions")
-                if st.button("Transcribe", key=f"transcribe_{call['id']}"):
-                    if not _check_rate_limit(current_user_id):
-                        st.error(f"Rate limit exceeded ({RATE_LIMIT_PER_HOUR} API calls/hour). Please wait.")
-                        logger.warning("Rate limit hit: user_id=%d", current_user_id)
-                    else:
-                        try:
-                            logger.info("Transcribe started: user_id=%d call_id=%d model=%s", current_user_id, call["id"], transcription_model)
-                            with st.spinner("Transcribing audio..."):
-                                transcript_text = transcribe_audio(
-                                    str(audio_path), model=transcription_model
-                                )
-                                update_call(
-                                    call["id"],
-                                    transcript_text=transcript_text,
-                                    status="transcribed",
-                                    transcription_model=transcription_model,
-                                    recruiter_name=edit_recruiter_name,
-                                    subject_name=edit_subject_name,
-                                    company_name=edit_company_name,
-                                    notes=edit_notes,
-                                    call_type=edit_call_type,
-                                )
-                            _record_api_call(current_user_id)
-                            insert_api_usage({
-                                "user_id": current_user_id,
-                                "call_id": call["id"],
-                                "operation": "transcription",
-                                "model": transcription_model,
-                                "estimated_cost_cents": 0,
-                                "created_at": datetime.utcnow().isoformat(),
-                            })
-                            logger.info("Transcribe complete: user_id=%d call_id=%d", current_user_id, call["id"])
-                            st.success("Transcription complete.")
-                            st.rerun()
-                        except Exception as e:
-                            logger.error("Transcribe failed: user_id=%d call_id=%d error=%s", current_user_id, call["id"], e)
-                            st.error(f"Transcription failed: {e}")
+                st.markdown("### Bullhorn Destination")
+                contact_label = call["subject_name"] or "Unmatched contact"
+                st.info(
+                    f"Note will be attached to: **{contact_label}**\n\n"
+                    "_Bullhorn record matching arrives in Phase 2 — for now, submission is stubbed._"
+                )
 
-                if st.button("Generate ATS Summary", key=f"summarize_{call['id']}"):
-                    if not _check_rate_limit(current_user_id):
-                        st.error(f"Rate limit exceeded ({RATE_LIMIT_PER_HOUR} API calls/hour). Please wait.")
-                        logger.warning("Rate limit hit: user_id=%d", current_user_id)
-                    else:
-                        refreshed_call = get_call(call["id"], user_id=query_user_id)
-                        transcript_text = refreshed_call["transcript_text"]
-                        if not transcript_text:
-                            st.error("Please transcribe the call first.")
-                        else:
-                            try:
-                                logger.info("Summarize started: user_id=%d call_id=%d model=%s", current_user_id, call["id"], summary_model)
-                                with st.spinner("Generating ATS-ready summary..."):
-                                    summary_text = summarize_transcript(
-                                        transcript_text=transcript_text,
-                                        call_type=edit_call_type,
-                                        metadata={
-                                            "recruiter_name": edit_recruiter_name,
-                                            "subject_name": edit_subject_name,
-                                            "company_name": edit_company_name,
-                                            "notes": edit_notes,
-                                        },
-                                        model=summary_model,
-                                    )
-                                    update_call(
-                                        call["id"],
-                                        summary_text=summary_text,
-                                        status="summarized",
-                                        summary_model=summary_model,
-                                        recruiter_name=edit_recruiter_name,
-                                        subject_name=edit_subject_name,
-                                        company_name=edit_company_name,
-                                        notes=edit_notes,
-                                        call_type=edit_call_type,
-                                    )
-                                _record_api_call(current_user_id)
-                                insert_api_usage({
-                                    "user_id": current_user_id,
-                                    "call_id": call["id"],
-                                    "operation": "summarization",
-                                    "model": summary_model,
-                                    "estimated_cost_cents": 0,
-                                    "created_at": datetime.utcnow().isoformat(),
-                                })
-                                logger.info("Summarize complete: user_id=%d call_id=%d", current_user_id, call["id"])
-                                st.success("Summary generated.")
-                                st.rerun()
-                            except Exception as e:
-                                logger.error("Summarize failed: user_id=%d call_id=%d error=%s", current_user_id, call["id"], e)
-                                st.error(f"Summary failed: {e}")
+                already_submitted = call["status"] == "submitted"
+                if already_submitted:
+                    st.success("This call has already been submitted.")
 
-                st.markdown("---")
                 if st.button(
-                    "Transcribe & Summarize",
-                    key=f"process_{call['id']}",
-                    help="Run transcription then immediately generate the ATS summary in one step.",
+                    "Submit to Bullhorn",
+                    key=f"submit_{call['id']}",
+                    type="primary",
+                    use_container_width=True,
+                    disabled=already_submitted,
                 ):
-                    if not _check_rate_limit(current_user_id):
-                        st.error(f"Rate limit exceeded ({RATE_LIMIT_PER_HOUR} API calls/hour). Please wait.")
-                        logger.warning("Rate limit hit: user_id=%d", current_user_id)
+                    if not call["transcript_text"]:
+                        st.error("Transcript not ready yet — please wait for transcription to complete.")
                     else:
-                        try:
-                            logger.info("Transcribe+Summarize started: user_id=%d call_id=%d", current_user_id, call["id"])
-                            with st.spinner("Transcribing audio..."):
-                                transcript_text = transcribe_audio(
-                                    str(audio_path), model=transcription_model
-                                )
-                                update_call(
-                                    call["id"],
-                                    transcript_text=transcript_text,
-                                    status="transcribed",
-                                    transcription_model=transcription_model,
-                                    recruiter_name=edit_recruiter_name,
-                                    subject_name=edit_subject_name,
-                                    company_name=edit_company_name,
-                                    notes=edit_notes,
-                                    call_type=edit_call_type,
-                                )
-                            _record_api_call(current_user_id)
-                            insert_api_usage({
-                                "user_id": current_user_id,
-                                "call_id": call["id"],
-                                "operation": "transcription",
-                                "model": transcription_model,
-                                "estimated_cost_cents": 0,
-                                "created_at": datetime.utcnow().isoformat(),
-                            })
-                            with st.spinner("Generating ATS-ready summary..."):
-                                summary_text = summarize_transcript(
-                                    transcript_text=transcript_text,
-                                    call_type=edit_call_type,
-                                    metadata={
-                                        "recruiter_name": edit_recruiter_name,
-                                        "subject_name": edit_subject_name,
-                                        "company_name": edit_company_name,
-                                        "notes": edit_notes,
-                                    },
-                                    model=summary_model,
-                                )
-                                update_call(
-                                    call["id"],
-                                    summary_text=summary_text,
-                                    status="summarized",
-                                    summary_model=summary_model,
-                                )
-                            _record_api_call(current_user_id)
-                            insert_api_usage({
-                                "user_id": current_user_id,
-                                "call_id": call["id"],
-                                "operation": "summarization",
-                                "model": summary_model,
-                                "estimated_cost_cents": 0,
-                                "created_at": datetime.utcnow().isoformat(),
-                            })
-                            logger.info("Transcribe+Summarize complete: user_id=%d call_id=%d", current_user_id, call["id"])
-                            st.success("Transcription and summary complete.")
-                            st.rerun()
-                        except Exception as e:
-                            logger.error("Transcribe+Summarize failed: user_id=%d call_id=%d error=%s", current_user_id, call["id"], e)
-                            st.error(f"Processing failed: {e}")
+                        update_call(call["id"], status="submitted")
+                        logger.info(
+                            "Stub Bullhorn submit: user_id=%d call_id=%d",
+                            current_user_id, call["id"],
+                        )
+                        st.success("Submitted to Bullhorn (stub — Phase 2 wires this to the real API).")
+                        st.rerun()
 
             with right:
                 st.markdown("### Transcript")
-                transcript_value = st.text_area(
-                    "Transcript Text",
-                    value=call["transcript_text"] or "",
-                    height=260,
-                )
-                if st.button(
-                    "Save Edited Transcript", key=f"save_transcript_{call['id']}"
-                ):
-                    update_call(call["id"], transcript_text=transcript_value)
-                    st.success("Transcript saved.")
-                    st.rerun()
-
-                st.markdown("### ATS Summary")
-                summary_value = st.text_area(
-                    "ATS-Ready Note",
-                    value=call["summary_text"] or "",
-                    height=360,
-                )
-
-                col_c, col_d = st.columns(2)
-                with col_c:
-                    if st.button(
-                        "Save Edited Summary", key=f"save_summary_{call['id']}"
-                    ):
-                        update_call(
-                            call["id"],
-                            summary_text=summary_value,
-                            status="reviewed",
-                        )
-                        st.success("Summary saved.")
+                try:
+                    transcript_text = ensure_transcript(call)
+                    st.text_area(
+                        "Transcript",
+                        value=transcript_text,
+                        height=520,
+                        disabled=True,
+                        label_visibility="collapsed",
+                        key=f"transcript_view_{call['id']}",
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Auto-transcribe failed: user_id=%d call_id=%d error=%s",
+                        current_user_id, call["id"], e,
+                    )
+                    st.error(f"Transcription failed: {e}")
+                    if st.button("Retry Transcription", key=f"retry_{call['id']}"):
                         st.rerun()
-                with col_d:
-                    st.download_button(
-                        "Download Summary TXT",
-                        data=(summary_value or "").encode("utf-8"),
-                        file_name=f"call_{call['id']}_summary.txt",
-                        mime="text/plain",
-                        key=f"dl_summary_{call['id']}",
-                    )
-
-                st.caption(
-                    "Tip: edit the transcript or summary above before copying into your ATS. Use the code block below to copy cleanly."
-                )
-
-                if call["summary_text"]:
-                    st.markdown("### Copy to ATS")
-                    st.code(call["summary_text"], language=None)
-
-                with st.expander("Diagnostics"):
-                    file_exists = audio_path.exists()
-                    st.write(f"**File Present:** {'Yes' if file_exists else 'No'}")
-                    if file_exists:
-                        size_kb = audio_path.stat().st_size / 1024
-                        st.write(f"**File Size:** {size_kb:.1f} KB")
-                    st.write(
-                        f"**ffmpeg Detected:** {'Yes' if ffmpeg_available() else 'No'}"
-                    )
-                    st.write(
-                        f"**Transcription Model:** {call['transcription_model'] or transcription_model}"
-                    )
-                    st.write(
-                        f"**Summary Model:** {call['summary_model'] or summary_model}"
-                    )
 
 
 # -----------------------------
-# CloudCall Recordings tab
+# Call Log tab (history view, no actions)
 # -----------------------------
-if cloudcall_tab is not None:
-    with cloudcall_tab:
-        from cloudcall_db import (
-            get_cloudcall_recordings,
-            get_cloudcall_recording,
-            update_cloudcall_recording,
-        )
-        from cloudcall_service import import_recording_to_pipeline, maybe_cleanup_expired
+with log_tab:
+    st.subheader("Call Log")
+    st.caption("History of all your calls with audio and transcripts. No actions — use the Calls tab to process or submit.")
 
-        # Run opportunistic cleanup
-        maybe_cleanup_expired()
+    log_calls = get_all_calls(user_id=query_user_id)
+    if not log_calls:
+        st.info("No calls in your log yet.")
+    else:
+        for row in log_calls:
+            try:
+                dt_short = datetime.fromisoformat(row["created_at"]).strftime("%b %d, %Y %I:%M %p")
+            except Exception:
+                dt_short = (row["created_at"] or "")[:16]
+            who = row["subject_name"] or row["original_filename"] or "Unknown"
+            status_pretty = (row["status"] or "").replace("_", " ").title()
 
-        st.subheader("CloudCall Recordings (Last 48 Hours)")
-
-        # Status filter
-        status_filter = st.selectbox(
-            "Filter by status",
-            options=["All", "Available", "Imported", "Error"],
-            index=0,
-            key="cc_status_filter",
-        )
-
-        cc_recordings = get_cloudcall_recordings(user_id=query_user_id, hours=48)
-
-        # Apply status filter
-        if status_filter != "All":
-            filter_val = status_filter.lower()
-            cc_recordings = [r for r in cc_recordings if r["status"] == filter_val]
-
-        if not cc_recordings:
-            st.info("No CloudCall recordings in the last 48 hours.")
-        else:
-            from zoneinfo import ZoneInfo
-            CT = ZoneInfo("America/Chicago")
-            UTC = ZoneInfo("UTC")
-
-            # Column headers
-            hdr_check, hdr_time, hdr_recruiter, hdr_contact, hdr_dur, hdr_dir, hdr_status = st.columns(
-                [0.5, 2.5, 2, 2.5, 1, 1, 1.5]
-            )
-            with hdr_check:
-                st.markdown("**Sel**")
-            with hdr_time:
-                st.markdown("**Date/Time (CT)**")
-            with hdr_recruiter:
-                st.markdown("**Recruiter**")
-            with hdr_contact:
-                st.markdown("**Contact**")
-            with hdr_dur:
-                st.markdown("**Duration**")
-            with hdr_dir:
-                st.markdown("**Direction**")
-            with hdr_status:
-                st.markdown("**Status**")
-
-            st.divider()
-
-            # Display recordings with checkboxes for selection
-            selected_ids = []
-            for rec in cc_recordings:
-                rec_id = rec["id"]
-                col_check, col_time, col_recruiter, col_contact, col_dur, col_dir, col_status = st.columns(
-                    [0.5, 2.5, 2, 2.5, 1, 1, 1.5]
-                )
-
-                with col_check:
-                    if rec["status"] == "available":
-                        if st.checkbox("Select recording", key=f"cc_sel_{rec_id}", label_visibility="collapsed"):
-                            selected_ids.append(rec_id)
-
-                with col_time:
-                    try:
-                        ts_str = rec["call_timestamp"]
-                        ts = datetime.fromisoformat(ts_str.replace(" ", "T"))
-                        # Assume UTC if naive, convert to Central
-                        if ts.tzinfo is None:
-                            ts = ts.replace(tzinfo=UTC)
-                        ts_ct = ts.astimezone(CT)
-                        st.write(ts_ct.strftime("%b %d, %I:%M %p"))
-                    except Exception:
-                        st.write(rec["call_timestamp"][:16])
-
-                with col_recruiter:
-                    recruiter = rec["recruiter_name"] if rec["recruiter_name"] else ""
-                    if not recruiter:
-                        recruiter = rec["caller_number"] or "—"
-                    st.write(recruiter)
-
-                with col_contact:
-                    contact = rec["contact_name"] if rec["contact_name"] else ""
-                    number = rec["callee_number"] or ""
-                    if contact and number and contact != number:
-                        st.write(f"{contact} ({number})")
-                    elif contact:
-                        st.write(contact)
-                    elif number:
-                        st.write(number)
+            with st.expander(f"#{row['id']} | {who} | {dt_short} | {status_pretty}"):
+                cols = st.columns([1, 2])
+                with cols[0]:
+                    st.write(f"**Contact:** {row['subject_name'] or '—'}")
+                    st.write(f"**Recruiter:** {row['recruiter_name'] or '—'}")
+                    st.write(f"**Status:** {status_pretty}")
+                    ap = storage.resolve(row["stored_path"])
+                    if ap.exists():
+                        st.audio(str(ap))
                     else:
-                        st.write("—")
-
-                with col_dur:
-                    dur = rec["call_duration_seconds"] or 0
-                    mins = dur // 60
-                    secs = dur % 60
-                    st.write(f"{mins}:{secs:02d}")
-
-                with col_dir:
-                    direction = (rec["direction"] or "").capitalize()
-                    if direction == "Inbound":
-                        st.write("Inbound")
-                    elif direction == "Outbound":
-                        st.write("Outbound")
+                        st.caption("_Audio file not found in storage._")
+                with cols[1]:
+                    if row["transcript_text"]:
+                        st.text_area(
+                            "Transcript",
+                            value=row["transcript_text"],
+                            height=260,
+                            disabled=True,
+                            key=f"log_t_{row['id']}",
+                            label_visibility="collapsed",
+                        )
                     else:
-                        st.write(direction or "—")
-
-                with col_status:
-                    status = rec["status"]
-                    if status == "available":
-                        st.write("Available")
-                    elif status == "imported":
-                        st.write(f"Imported (#{rec['imported_call_id']})")
-                    elif status == "importing":
-                        st.write("Importing...")
-                    elif status == "error":
-                        st.write("Error")
-
-                # Show error details in expander
-                if rec["status"] == "error" and rec["error_message"]:
-                    with st.expander(f"Error details — Recording #{rec_id}"):
-                        st.error(rec["error_message"])
-
-            # Import actions
-            if selected_ids:
-                st.markdown("---")
-                st.write(f"**{len(selected_ids)} recording(s) selected**")
-
-                import_col1, import_col2 = st.columns(2)
-                with import_col1:
-                    import_call_type = st.selectbox(
-                        "Call Type for Import",
-                        options=list(CALL_TYPE_CONFIG.keys()),
-                        format_func=lambda k: CALL_TYPE_CONFIG[k]["label"],
-                        index=0,
-                        key="cc_import_call_type",
-                    )
-                with import_col2:
-                    import_subject = st.text_input(
-                        "Candidate / Subject Name (optional)",
-                        key="cc_import_subject",
-                    )
-
-                btn_col1, btn_col2, btn_col3 = st.columns(3)
-                with btn_col1:
-                    do_import = st.button("Import Only", key="cc_import_only")
-                with btn_col2:
-                    do_import_transcribe = st.button("Import & Transcribe", key="cc_import_transcribe")
-                with btn_col3:
-                    do_full_pipeline = st.button("Full Pipeline", key="cc_full_pipeline")
-
-                if do_import or do_import_transcribe or do_full_pipeline:
-                    success_count = 0
-                    error_count = 0
-                    for sel_id in selected_ids:
-                        try:
-                            rec_data = get_cloudcall_recording(sel_id)
-                            if not rec_data:
-                                continue
-
-                            metadata = {
-                                "recruiter_name": current_user["display_name"],
-                                "subject_name": import_subject,
-                                "company_name": "",
-                                "notes": f"Imported from CloudCall. Direction: {rec_data['direction'] or 'unknown'}",
-                            }
-
-                            with st.spinner(f"Importing recording #{sel_id}..."):
-                                new_call_id = import_recording_to_pipeline(
-                                    sel_id, current_user_id, import_call_type, metadata
-                                )
-
-                            # Optionally transcribe
-                            if do_import_transcribe or do_full_pipeline:
-                                if _check_rate_limit(current_user_id):
-                                    call = get_call(new_call_id, user_id=query_user_id)
-                                    if call:
-                                        audio_path = storage.resolve(call["stored_path"])
-                                        with st.spinner(f"Transcribing call #{new_call_id}..."):
-                                            transcript_text = transcribe_audio(
-                                                str(audio_path), model=transcription_model
-                                            )
-                                            update_call(
-                                                new_call_id,
-                                                transcript_text=transcript_text,
-                                                status="transcribed",
-                                                transcription_model=transcription_model,
-                                            )
-                                        _record_api_call(current_user_id)
-                                        insert_api_usage({
-                                            "user_id": current_user_id,
-                                            "call_id": new_call_id,
-                                            "operation": "transcription",
-                                            "model": transcription_model,
-                                            "estimated_cost_cents": 0,
-                                            "created_at": datetime.utcnow().isoformat(),
-                                        })
-
-                                        # Optionally summarize
-                                        if do_full_pipeline and _check_rate_limit(current_user_id):
-                                            with st.spinner(f"Summarizing call #{new_call_id}..."):
-                                                summary_text = summarize_transcript(
-                                                    transcript_text=transcript_text,
-                                                    call_type=import_call_type,
-                                                    metadata=metadata,
-                                                    model=summary_model,
-                                                )
-                                                update_call(
-                                                    new_call_id,
-                                                    summary_text=summary_text,
-                                                    status="summarized",
-                                                    summary_model=summary_model,
-                                                )
-                                            _record_api_call(current_user_id)
-                                            insert_api_usage({
-                                                "user_id": current_user_id,
-                                                "call_id": new_call_id,
-                                                "operation": "summarization",
-                                                "model": summary_model,
-                                                "estimated_cost_cents": 0,
-                                                "created_at": datetime.utcnow().isoformat(),
-                                            })
-                                else:
-                                    st.warning(f"Rate limit reached. Call #{new_call_id} imported but not transcribed.")
-
-                            success_count += 1
-                            logger.info(
-                                "CloudCall import: user_id=%d recording_id=%d call_id=%d",
-                                current_user_id, sel_id, new_call_id,
-                            )
-                        except Exception as e:
-                            error_count += 1
-                            logger.error(
-                                "CloudCall import failed: user_id=%d recording_id=%d error=%s",
-                                current_user_id, sel_id, e,
-                            )
-                            st.error(f"Failed to import recording #{sel_id}: {e}")
-
-                    if success_count > 0:
-                        st.success(f"Successfully imported {success_count} recording(s). Check the Call Queue tab.")
-                    if error_count > 0:
-                        st.warning(f"{error_count} recording(s) failed to import.")
-                    st.rerun()
+                        st.caption("_Transcript not yet generated. Open this call on the Calls tab to transcribe it._")
 
 
 # -----------------------------
@@ -832,7 +388,6 @@ if admin_tab is not None:
         # --- User Management ---
         st.markdown("### User Management")
         users = get_all_users()
-
         if users:
             for u in users:
                 col_name, col_email, col_role, col_status, col_action = st.columns([2, 3, 1, 1, 2])
@@ -863,7 +418,6 @@ if admin_tab is not None:
             new_password = st.text_input("Password", type="password")
             new_role = st.selectbox("Role", options=["recruiter", "admin"])
             create_submitted = st.form_submit_button("Create User")
-
             if create_submitted:
                 if not new_email or not new_name or not new_password:
                     st.error("All fields are required.")
@@ -901,7 +455,7 @@ if admin_tab is not None:
         else:
             st.info("No API usage recorded yet.")
 
-        # --- CloudCall User Mappings (only when integration is enabled) ---
+        # --- CloudCall User Mappings ---
         if CLOUDCALL_ENABLED:
             from cloudcall_db import (
                 get_all_cloudcall_user_mappings,
@@ -912,7 +466,7 @@ if admin_tab is not None:
 
             st.markdown("---")
             st.markdown("### CloudCall User Mappings")
-            st.caption("Map CloudCall user IDs / extensions to app users so recordings route to the right recruiter.")
+            st.caption("Map CloudCall user IDs / extensions to app users so recordings auto-import to the right recruiter.")
 
             mappings = get_all_cloudcall_user_mappings()
             if mappings:
@@ -931,7 +485,6 @@ if admin_tab is not None:
             else:
                 st.info("No CloudCall user mappings configured yet.")
 
-            # Unmapped recordings alert
             unmapped_ids = get_unmapped_cloudcall_user_ids()
             if unmapped_ids:
                 st.warning(
@@ -939,19 +492,17 @@ if admin_tab is not None:
                     f"{', '.join(unmapped_ids)}"
                 )
 
-            # Add new mapping form
             st.markdown("#### Add New Mapping")
             with st.form("add_cc_mapping"):
-                all_users = get_all_users()
+                all_users_for_map = get_all_users()
                 cc_user_id = st.text_input("CloudCall User ID / Extension")
                 cc_display_name = st.text_input("CloudCall Display Name (optional)")
-                app_user_options = {f"{u['display_name']} ({u['email']})": u["id"] for u in all_users}
+                app_user_options = {f"{u['display_name']} ({u['email']})": u["id"] for u in all_users_for_map}
                 selected_app_user_label = st.selectbox(
                     "App User",
                     options=list(app_user_options.keys()),
                 )
                 mapping_submitted = st.form_submit_button("Save Mapping")
-
                 if mapping_submitted:
                     if not cc_user_id:
                         st.error("CloudCall User ID is required.")
@@ -964,3 +515,96 @@ if admin_tab is not None:
                         )
                         st.success(f"Mapping saved: {cc_user_id} -> {selected_app_user_label}")
                         st.rerun()
+
+        # --- Manual Upload (admin backup) ---
+        st.markdown("---")
+        st.markdown("### Manual Upload (Backup)")
+        st.caption("Backup ingest path for cases when CloudCall didn't capture a call. Files upload into the currently signed-in admin's call list.")
+
+        with st.form("manual_upload_form"):
+            uploaded_file = st.file_uploader(
+                "Audio file",
+                type=None,
+                help="Any audio format accepted — ffmpeg converts to WAV automatically.",
+            )
+            up_col1, up_col2 = st.columns(2)
+            with up_col1:
+                up_recruiter = st.text_input("Recruiter Name", value=current_user["display_name"])
+                up_subject = st.text_input("Contact Name")
+            with up_col2:
+                up_company = st.text_input("Company / Client")
+                up_notes = st.text_area("Notes", placeholder="Optional context.")
+            up_submitted = st.form_submit_button("Save Recording")
+            if up_submitted:
+                if not uploaded_file:
+                    st.error("Please choose an audio file.")
+                else:
+                    try:
+                        file_info = save_uploaded_file(uploaded_file)
+                        record = {
+                            "created_at": datetime.utcnow().isoformat(),
+                            **file_info,
+                            "recruiter_name": up_recruiter,
+                            "subject_name": up_subject,
+                            "company_name": up_company,
+                            "notes": up_notes,
+                            "call_type": "general_recruiter_call",
+                            "status": "uploaded",
+                            "transcript_text": None,
+                            "summary_text": None,
+                            "transcription_model": None,
+                            "summary_model": None,
+                            "user_id": current_user_id,
+                        }
+                        new_id = insert_call(record)
+                        logger.info(
+                            "Manual upload: user_id=%d call_id=%d file=%s",
+                            current_user_id, new_id, file_info.get("original_filename", ""),
+                        )
+                        st.success(f"Recording saved. Call ID: {new_id}")
+                    except Exception as e:
+                        logger.error("Manual upload failed: user_id=%d error=%s", current_user_id, e)
+                        st.error(f"Upload failed: {e}")
+                        if not ffmpeg_available():
+                            st.info("Install ffmpeg, then restart Streamlit. Windows: `winget install Gyan.FFmpeg`")
+
+        # --- CloudCall Raw Inbox (admin troubleshooting) ---
+        if CLOUDCALL_ENABLED:
+            from cloudcall_db import (
+                get_cloudcall_recordings,
+                get_cloudcall_recording,
+                update_cloudcall_recording,
+            )
+            from cloudcall_service import import_recording_to_pipeline, maybe_cleanup_expired
+
+            maybe_cleanup_expired()
+
+            st.markdown("---")
+            st.markdown("### CloudCall Raw Inbox")
+            st.caption(
+                "Recordings polled from CloudCall in the last 72 hours. Mapped recordings are auto-imported. "
+                "Use this section to troubleshoot unmapped or failed imports."
+            )
+
+            inbox = get_cloudcall_recordings(user_id=None, hours=72)
+            if not inbox:
+                st.info("No CloudCall recordings in the last 72 hours.")
+            else:
+                import pandas as pd
+                rows = []
+                for r in inbox:
+                    try:
+                        ts = datetime.fromisoformat((r["call_timestamp"] or "").replace(" ", "T")).strftime("%b %d %I:%M %p")
+                    except Exception:
+                        ts = (r["call_timestamp"] or "")[:16]
+                    rows.append({
+                        "Date": ts,
+                        "CC User": r["cloudcall_user_id"] or "—",
+                        "Recruiter": r["recruiter_name"] or "—",
+                        "Contact": r["contact_name"] or r["callee_number"] or "—",
+                        "Direction": r["direction"] or "—",
+                        "Status": r["status"],
+                        "Call ID": r["imported_call_id"] if "imported_call_id" in r.keys() else None,
+                        "Error": (r["error_message"] or "") if "error_message" in r.keys() else "",
+                    })
+                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
