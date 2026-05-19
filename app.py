@@ -11,7 +11,8 @@ from db import (
     init_db, insert_call, update_call, get_all_calls, get_call,
     insert_api_usage, get_all_users, get_usage_summary, update_user,
 )
-from openai_service import transcribe_audio, diarize_transcript
+from openai_service import transcribe_audio, diarize_transcript, analyze_call
+from call_templates import CALL_TEMPLATES
 from file_service import save_uploaded_file, ffmpeg_available
 from auth import (
     authenticate, login, logout, get_current_user, is_admin,
@@ -333,6 +334,104 @@ with calls_tab:
                     if st.button("Retry Transcription", key=f"retry_{call['id']}"):
                         st.rerun()
 
+            # -------------------------
+            # Call Coaching section
+            # -------------------------
+            st.markdown("---")
+            st.markdown("### Call Coaching")
+            st.caption(
+                "Pick the type of call and click Analyze to evaluate how well the "
+                "transcript matched the template for that call type."
+            )
+
+            coach_options = list(CALL_TEMPLATES.keys())
+            default_idx = (
+                coach_options.index(call["call_type"])
+                if call["call_type"] in coach_options
+                else 0
+            )
+
+            coach_left, coach_right = st.columns([3, 1])
+            with coach_left:
+                selected_call_type = st.selectbox(
+                    "Call Type",
+                    options=coach_options,
+                    format_func=lambda k: CALL_TEMPLATES[k]["label"],
+                    index=default_idx,
+                    key=f"coach_type_{call['id']}",
+                )
+            with coach_right:
+                st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+                analyze_clicked = st.button(
+                    "Analyze Call",
+                    key=f"analyze_{call['id']}",
+                    use_container_width=True,
+                    disabled=not call["transcript_text"],
+                    help="Compare the transcript against the template for the selected call type.",
+                )
+
+            if analyze_clicked:
+                if not _check_rate_limit(current_user_id):
+                    st.error(
+                        f"Rate limit exceeded ({RATE_LIMIT_PER_HOUR} API calls/hour). Please wait."
+                    )
+                    logger.warning("Rate limit hit on analyze: user_id=%d", current_user_id)
+                else:
+                    try:
+                        template_cfg = CALL_TEMPLATES[selected_call_type]
+                        logger.info(
+                            "Call analysis started: user_id=%d call_id=%d call_type=%s",
+                            current_user_id, call["id"], selected_call_type,
+                        )
+                        with st.spinner("Analyzing call against template..."):
+                            analysis_text = analyze_call(
+                                transcript_text=call["transcript_text"],
+                                call_type_label=template_cfg["label"],
+                                template=template_cfg["template"],
+                                metadata={
+                                    "recruiter_name": call["recruiter_name"],
+                                    "subject_name": call["subject_name"],
+                                },
+                                model=DEFAULT_DIARIZATION_MODEL,
+                            )
+                        # Tag the saved analysis with which call type it was run against
+                        stored_analysis = (
+                            f"_Analyzed as: **{template_cfg['label']}**_\n\n{analysis_text}"
+                        )
+                        update_call(
+                            call["id"],
+                            call_type=selected_call_type,
+                            summary_text=stored_analysis,
+                        )
+                        _record_api_call(current_user_id)
+                        insert_api_usage({
+                            "user_id": current_user_id,
+                            "call_id": call["id"],
+                            "operation": "analysis",
+                            "model": DEFAULT_DIARIZATION_MODEL,
+                            "estimated_cost_cents": 0,
+                            "created_at": datetime.utcnow().isoformat(),
+                        })
+                        logger.info(
+                            "Call analysis complete: user_id=%d call_id=%d",
+                            current_user_id, call["id"],
+                        )
+                        st.rerun()
+                    except Exception as e:
+                        logger.error(
+                            "Call analysis failed: user_id=%d call_id=%d error=%s",
+                            current_user_id, call["id"], e,
+                        )
+                        st.error(f"Analysis failed: {e}")
+
+            if call["summary_text"]:
+                st.markdown(call["summary_text"])
+            else:
+                st.caption(
+                    "_No analysis yet for this call. Pick a call type above and "
+                    "click Analyze Call._"
+                )
+
 
 # -----------------------------
 # Call Log tab (history view, no actions)
@@ -376,6 +475,10 @@ with log_tab:
                         )
                     else:
                         st.caption("_Transcript not yet generated. Open this call on the Calls tab to transcribe it._")
+
+                if row["summary_text"]:
+                    st.markdown("**Coaching Analysis**")
+                    st.markdown(row["summary_text"])
 
 
 # -----------------------------

@@ -82,3 +82,74 @@ def diarize_transcript(
     result = response.choices[0].message.content.strip()
     logger.info("Diarization complete: model=%s chars=%d", model, len(result))
     return result
+
+
+def analyze_call(
+    transcript_text: str,
+    call_type_label: str,
+    template: str,
+    metadata: Dict[str, Any],
+    model: str = "gpt-4.1",
+) -> str:
+    """Evaluate a call transcript against a coaching template.
+
+    Returns a markdown evaluation with three sections:
+    Covered Well, Not Covered Well Enough, Missed.
+    """
+    logger.info(
+        "Call analysis started: model=%s call_type=%s chars=%d",
+        model, call_type_label, len(transcript_text),
+    )
+
+    recruiter = (metadata.get("recruiter_name") or "").strip() or "the recruiter"
+    subject = (metadata.get("subject_name") or "").strip() or "the contact"
+
+    system_prompt = (
+        "You are a recruiter call coach. The user will give you a transcript of a "
+        f"{call_type_label.lower()} along with a template describing what should "
+        "have been covered. Your job is to evaluate how well the recruiter "
+        f"({recruiter}) executed the call against that template. Be specific, "
+        "direct, and cite the transcript when it helps. Be constructive but honest "
+        "— this feedback is for the recruiter to improve."
+    )
+
+    user_prompt = (
+        f"Call Type: {call_type_label}\n"
+        f"Recruiter: {recruiter}\n"
+        f"Contact: {subject}\n\n"
+        "TEMPLATE — what the call should have covered:\n"
+        "----------\n"
+        f"{template}\n"
+        "----------\n\n"
+        "TRANSCRIPT:\n"
+        "----------\n"
+        f"{transcript_text}\n"
+        "----------\n\n"
+        "Return your evaluation as markdown with exactly these three sections, "
+        "each followed by a bulleted list. If a section has no items, write "
+        "_None._ on its own line beneath the heading.\n\n"
+        "## Covered Well\n"
+        "(Points clearly and effectively addressed in the conversation.)\n\n"
+        "## Not Covered Well Enough\n"
+        "(Points that were touched on but only superficially, partially, or "
+        "without enough depth.)\n\n"
+        "## Missed\n"
+        "(Points the recruiter did not address at all.)\n\n"
+        "For each bullet, briefly quote or paraphrase the relevant moment in the "
+        "transcript (or note its absence). Keep bullets short and specific.\n\n"
+        "If the template above is clearly a placeholder, evaluate against the "
+        "suggested points it lists and add a final note that the template is a "
+        "placeholder and should be replaced with the real one for sharper feedback."
+    )
+
+    client = get_openai_client()
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    result = response.choices[0].message.content.strip()
+    logger.info("Call analysis complete: model=%s chars=%d", model, len(result))
+    return result
