@@ -210,14 +210,15 @@ def ensure_transcript(call) -> str:
 # -----------------------------
 # Tabs
 # -----------------------------
-tab_names = ["Calls", "Call Log"]
+tab_names = ["Calls", "Call Log", "Templates"]
 if user_is_admin:
     tab_names.append("Admin")
 
 tabs = st.tabs(tab_names)
 calls_tab = tabs[0]
 log_tab = tabs[1]
-admin_tab = tabs[2] if user_is_admin else None
+templates_tab = tabs[2]
+admin_tab = tabs[3] if user_is_admin else None
 
 
 # -----------------------------
@@ -488,6 +489,23 @@ with log_tab:
                 if row["summary_text"]:
                     st.markdown("**Coaching Analysis**")
                     st.markdown(row["summary_text"])
+
+
+# -----------------------------
+# Templates tab (reference view)
+# -----------------------------
+with templates_tab:
+    st.subheader("Call Templates")
+    st.caption(
+        "These are the templates the Analyze Call feature evaluates transcripts "
+        "against. Use this tab to review what each call type should cover — "
+        "pull it up before or during a call as a reference."
+    )
+
+    # Default-open the first one so the page lands on something visible
+    for i, (key, cfg) in enumerate(CALL_TEMPLATES.items()):
+        with st.expander(cfg["label"], expanded=(i == 0)):
+            st.markdown(cfg["template"])
 
 
 # -----------------------------
