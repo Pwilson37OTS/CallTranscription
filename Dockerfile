@@ -24,8 +24,8 @@ COPY --from=ffmpeg /ffprobe /usr/local/bin/ffprobe
 # The slim image's docker-clean apt config deletes downloaded .debs right
 # after install, which would also empty the cache mount. We remove it so
 # the cache mount can actually retain packages across builds.
-RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
-    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+RUN --mount=type=cache,id=calltranscription-apt-cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,id=calltranscription-apt-lib,target=/var/lib/apt,sharing=locked \
     rm -f /etc/apt/apt.conf.d/docker-clean && \
     apt-get update && \
     apt-get install -y --no-install-recommends \
@@ -37,7 +37,7 @@ WORKDIR /app
 
 # pip cache mount for faster rebuilds
 COPY requirements.txt .
-RUN --mount=type=cache,target=/root/.cache/pip \
+RUN --mount=type=cache,id=calltranscription-pip,target=/root/.cache/pip \
     pip install -r requirements.txt
 
 # Application code
