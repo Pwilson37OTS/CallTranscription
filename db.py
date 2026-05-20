@@ -9,7 +9,13 @@ def get_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(DB_PATH, timeout=10)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
-    conn.execute("PRAGMA journal_mode = WAL")
+    # journal_mode=DELETE (the SQLite default) instead of WAL. WAL is faster
+    # for concurrent access but is unreliable on Railway's network-mounted
+    # persistent volumes — boot can fail with "disk I/O error" when SQLite
+    # tries to create the .db-wal/.db-shm sidecar files. DELETE works on any
+    # filesystem; the timeout=10 above means readers/writers wait on locks
+    # instead of failing.
+    conn.execute("PRAGMA journal_mode = DELETE")
     return conn
 
 
