@@ -324,8 +324,47 @@ def import_recording_to_pipeline(
             download_path.unlink(missing_ok=True)
 
 
+def cleanup_old_files(retention_hours: int = None) -> int:
+    """Delete audio files older than retention_hours across all data directories.
+
+    Scans data/converted/, data/uploads/, and data/cloudcall_downloads/ and
+    removes any file whose modification time is older than the cutoff.
+    Returns the number of files removed. Safe to call when the volume is
+    nearly full — `unlink` only releases space, doesn't require any.
+    """
+    from config import CONVERTED_DIR, UPLOAD_DIR
+
+    if retention_hours is None:
+        retention_hours = CLOUDCALL_RECORDING_RETENTION_HOURS
+
+    dirs_to_clean = [CONVERTED_DIR, UPLOAD_DIR, CLOUDCALL_DOWNLOAD_DIR]
+    cutoff_seconds = time() - (retention_hours * 3600)
+    removed = 0
+    bytes_freed = 0
+
+    for d in dirs_to_clean:
+        if not d.exists():
+            continue
+        for f in d.iterdir():
+            try:
+                if f.is_file() and f.stat().st_mtime < cutoff_seconds:
+                    size = f.stat().st_size
+                    f.unlink()
+                    removed += 1
+                    bytes_freed += size
+            except OSError as e:
+                logger.warning("Failed to remove %s: %s", f, e)
+
+    if removed > 0:
+        logger.info(
+            "File cleanup: removed %d audio file(s), freed %.1f MB",
+            removed, bytes_freed / (1024 * 1024),
+        )
+    return removed
+
+
 def maybe_cleanup_expired():
-    """Run expired recording cleanup if enough time has passed since last run."""
+    """Run expired recording + audio file cleanup if enough time has passed."""
     global _last_cleanup_time
     now = time()
     if now - _last_cleanup_time >= _CLEANUP_INTERVAL_SECONDS:
@@ -333,7 +372,8 @@ def maybe_cleanup_expired():
         try:
             deleted = delete_expired_cloudcall_recordings(CLOUDCALL_RECORDING_RETENTION_HOURS)
             if deleted > 0:
-                logger.info("Cleanup: deleted %d expired CloudCall recordings", deleted)
+                logger.info("DB cleanup: deleted %d expired CloudCall recording rows", deleted)
+            cleanup_old_files(CLOUDCALL_RECORDING_RETENTION_HOURS)
             return deleted
         except Exception as e:
             logger.error("Cleanup failed: %s", e)

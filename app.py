@@ -36,6 +36,15 @@ if not os.getenv("OPENAI_API_KEY"):
 
 st.markdown(APP_CSS, unsafe_allow_html=True)
 
+# Startup audio-file cleanup. Runs BEFORE init_db() so that if the persistent
+# volume is full, we free space before SQLite tries to write its journal.
+# Best-effort: a failure here must never block app boot.
+try:
+    from cloudcall_service import cleanup_old_files
+    cleanup_old_files()
+except Exception as _e:
+    logger.warning("Startup file cleanup skipped: %s", _e)
+
 init_db()
 ensure_admin_exists()
 
