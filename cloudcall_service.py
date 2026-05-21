@@ -325,14 +325,13 @@ def import_recording_to_pipeline(
 
 
 def cleanup_old_files(retention_hours: int = None) -> int:
-    """Delete audio files older than retention_hours across all data directories.
+    """Delete files older than retention_hours across all data directories.
 
-    Scans data/converted/, data/uploads/, and data/cloudcall_downloads/ and
-    removes any file whose modification time is older than the cutoff.
-    Returns the number of files removed. Safe to call when the volume is
-    nearly full — `unlink` only releases space, doesn't require any.
+    Covers data/converted/, data/uploads/, data/cloudcall_downloads/, and
+    rotated log backups (data/logs/*.log.*). The active app.log is left
+    alone — RotatingFileHandler manages it. Returns the count removed.
     """
-    from config import CONVERTED_DIR, UPLOAD_DIR
+    from config import CONVERTED_DIR, UPLOAD_DIR, DATA_DIR
 
     if retention_hours is None:
         retention_hours = CLOUDCALL_RECORDING_RETENTION_HOURS
@@ -355,30 +354,173 @@ def cleanup_old_files(retention_hours: int = None) -> int:
             except OSError as e:
                 logger.warning("Failed to remove %s: %s", f, e)
 
+    # Rotated log backups (app.log.1, app.log.2, ...). Skip the active
+    # app.log so we don't disrupt the running logger.
+    log_dir = DATA_DIR / "logs"
+    if log_dir.exists():
+        for f in log_dir.iterdir():
+            try:
+                if (
+                    f.is_file()
+                    and f.name != "app.log"
+                    and f.stat().st_mtime < cutoff_seconds
+                ):
+                    size = f.stat().st_size
+                    f.unlink()
+                    removed += 1
+                    bytes_freed += size
+            except OSError as e:
+                logger.warning("Failed to remove %s: %s", f, e)
+
     if removed > 0:
         logger.info(
-            "File cleanup: removed %d audio file(s), freed %.1f MB",
+            "File cleanup: removed %d file(s), freed %.1f MB",
             removed, bytes_freed / (1024 * 1024),
         )
     return removed
 
 
-def maybe_cleanup_expired():
-    """Run expired recording + audio file cleanup if enough time has passed."""
+def maybe_cleanup_expired(force: bool = False):
+    """Run expired recording + audio file cleanup if enough time has passed.
+
+    Pass force=True to bypass the 15-minute throttle (used by the admin
+    "Force Cleanup Now" button).
+    """
     global _last_cleanup_time
     now = time()
-    if now - _last_cleanup_time >= _CLEANUP_INTERVAL_SECONDS:
+    if force or (now - _last_cleanup_time >= _CLEANUP_INTERVAL_SECONDS):
         _last_cleanup_time = now
         try:
             deleted = delete_expired_cloudcall_recordings(CLOUDCALL_RECORDING_RETENTION_HOURS)
             if deleted > 0:
                 logger.info("DB cleanup: deleted %d expired CloudCall recording rows", deleted)
-            cleanup_old_files(CLOUDCALL_RECORDING_RETENTION_HOURS)
-            return deleted
+            removed = cleanup_old_files(CLOUDCALL_RECORDING_RETENTION_HOURS)
+            return {"db_rows_deleted": deleted, "files_removed": removed}
         except Exception as e:
             logger.error("Cleanup failed: %s", e)
-            return 0
-    return 0
+            return {"db_rows_deleted": 0, "files_removed": 0, "error": str(e)}
+    return {"db_rows_deleted": 0, "files_removed": 0}
+
+
+def get_storage_breakdown() -> list:
+    """Return size + file count for each data directory and the SQLite DB."""
+    from config import DATA_DIR, UPLOAD_DIR, CONVERTED_DIR, DB_PATH
+
+    items = []
+
+    # Database file (plus any WAL/SHM sidecars)
+    db_total = 0
+    db_files = 0
+    for stem in [DB_PATH, DB_PATH.with_suffix(DB_PATH.suffix + "-wal"), DB_PATH.with_suffix(DB_PATH.suffix + "-shm")]:
+        if stem.exists():
+            db_total += stem.stat().st_size
+            db_files += 1
+    items.append({
+        "path": "data/calls.db (+sidecars)",
+        "files": db_files,
+        "size_bytes": db_total,
+    })
+
+    dirs_to_check = [
+        ("data/converted", CONVERTED_DIR),
+        ("data/uploads", UPLOAD_DIR),
+        ("data/cloudcall_downloads", CLOUDCALL_DOWNLOAD_DIR),
+        ("data/logs", DATA_DIR / "logs"),
+    ]
+    for label, d in dirs_to_check:
+        size = 0
+        count = 0
+        if d.exists():
+            for f in d.iterdir():
+                if f.is_file():
+                    try:
+                        size += f.stat().st_size
+                        count += 1
+                    except OSError:
+                        pass
+        items.append({"path": label, "files": count, "size_bytes": size})
+
+    return items
+
+
+def reimport_unmapped_recordings() -> dict:
+    """Find recordings that were polled before a CloudCall user mapping existed
+    and now have a mapping. Attempt to import each one.
+
+    Returns dict with: scanned, mappable, succeeded, failed.
+    """
+    from cloudcall_db import get_conn as _get_cc_conn, get_cloudcall_user_mapping, update_cloudcall_recording
+
+    conn = _get_cc_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id, cloudcall_user_id FROM cloudcall_recordings "
+            "WHERE status = 'available' AND app_user_id IS NULL"
+        ).fetchall()
+    finally:
+        conn.close()
+
+    scanned = len(rows)
+    mappable = 0
+    succeeded = 0
+    failed = 0
+
+    for row in rows:
+        cc_user_id = row["cloudcall_user_id"]
+        if not cc_user_id:
+            continue
+        mapping = get_cloudcall_user_mapping(cc_user_id)
+        if not mapping:
+            continue
+        mappable += 1
+        try:
+            update_cloudcall_recording(row["id"], app_user_id=mapping["app_user_id"])
+            import_recording_to_pipeline(
+                cloudcall_recording_db_id=row["id"],
+                user_id=mapping["app_user_id"],
+                metadata={},
+            )
+            succeeded += 1
+        except Exception as e:
+            failed += 1
+            logger.warning("Re-import failed for recording %d: %s", row["id"], e)
+
+    return {
+        "scanned": scanned,
+        "mappable": mappable,
+        "succeeded": succeeded,
+        "failed": failed,
+    }
+
+
+def get_cloudcall_ingest_stats() -> dict:
+    """Return counts useful for diagnosing why few calls are visible.
+
+    Counts cloudcall_recordings rows by status, and counts unmapped recordings.
+    """
+    from cloudcall_db import get_conn as _get_cc_conn
+
+    conn = _get_cc_conn()
+    try:
+        rows = conn.execute(
+            "SELECT status, COUNT(*) AS c FROM cloudcall_recordings GROUP BY status"
+        ).fetchall()
+        by_status = {r["status"]: r["c"] for r in rows}
+
+        unmapped = conn.execute(
+            "SELECT COUNT(*) AS c FROM cloudcall_recordings "
+            "WHERE status = 'available' AND app_user_id IS NULL"
+        ).fetchone()["c"]
+
+        total = conn.execute("SELECT COUNT(*) AS c FROM cloudcall_recordings").fetchone()["c"]
+    finally:
+        conn.close()
+
+    return {
+        "total_recordings": total,
+        "by_status": by_status,
+        "unmapped_available": unmapped,
+    }
 
 
 # ---------------------------------------------------------------------------

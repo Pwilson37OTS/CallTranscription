@@ -564,6 +564,51 @@ if admin_tab is not None:
                         else:
                             st.error(f"Failed to create user: {e}")
 
+        # --- Storage Usage ---
+        st.markdown("---")
+        st.markdown("### Storage Usage")
+        st.caption(
+            f"Files older than the retention window "
+            f"({int(os.getenv('CLOUDCALL_RECORDING_RETENTION_HOURS', '72'))} hours) "
+            "are auto-pruned every 15 minutes via the background poller and on each "
+            "container restart. Use Force Cleanup Now to run immediately."
+        )
+        try:
+            from cloudcall_service import get_storage_breakdown
+            breakdown = get_storage_breakdown()
+            import pandas as _pd
+            sdf = _pd.DataFrame(breakdown)
+            sdf["Size"] = sdf["size_bytes"].map(lambda b: f"{b / (1024 * 1024):.1f} MB")
+            sdf["Files"] = sdf["files"]
+            sdf["Path"] = sdf["path"]
+            st.dataframe(sdf[["Path", "Files", "Size"]], use_container_width=True, hide_index=True)
+            total_mb = sum(b["size_bytes"] for b in breakdown) / (1024 * 1024)
+            st.caption(f"**Total app data: {total_mb:.1f} MB**")
+        except Exception as e:
+            st.error(f"Could not read storage breakdown: {e}")
+
+        if st.button("Force Cleanup Now", key="force_cleanup_btn", help="Run cleanup immediately, bypassing the 15-minute throttle."):
+            try:
+                from cloudcall_service import maybe_cleanup_expired
+                with st.spinner("Running cleanup..."):
+                    result = maybe_cleanup_expired(force=True)
+                files = result.get("files_removed", 0)
+                rows = result.get("db_rows_deleted", 0)
+                if "error" in result:
+                    st.error(f"Cleanup ran with errors: {result['error']}")
+                else:
+                    st.success(
+                        f"Cleanup complete — removed {files} file(s) and {rows} expired CloudCall recording row(s)."
+                    )
+                logger.info(
+                    "Admin force cleanup: user_id=%d files=%d rows=%d",
+                    current_user_id, files, rows,
+                )
+                st.rerun()
+            except Exception as e:
+                logger.error("Force cleanup failed: user_id=%d error=%s", current_user_id, e)
+                st.error(f"Cleanup failed: {e}")
+
         # --- API Usage ---
         st.markdown("---")
         st.markdown("### API Usage (Last 30 Days)")
@@ -584,6 +629,61 @@ if admin_tab is not None:
             st.dataframe(df, use_container_width=True, hide_index=True)
         else:
             st.info("No API usage recorded yet.")
+
+        # --- CloudCall Ingest Stats ---
+        if CLOUDCALL_ENABLED:
+            from cloudcall_service import get_cloudcall_ingest_stats, reimport_unmapped_recordings
+
+            st.markdown("---")
+            st.markdown("### CloudCall Ingest Status")
+            st.caption(
+                "Diagnostics for what the poller has pulled in. The background "
+                "poller runs continuously during business hours (configurable) — "
+                "you do not need the app to be open for calls to be collected."
+            )
+            try:
+                stats = get_cloudcall_ingest_stats()
+                stat_cols = st.columns(3)
+                with stat_cols[0]:
+                    st.metric("Total recordings polled", stats["total_recordings"])
+                with stat_cols[1]:
+                    st.metric("Currently unmapped", stats["unmapped_available"])
+                with stat_cols[2]:
+                    by_status = stats["by_status"]
+                    st.metric("Imported into Call Log", by_status.get("imported", 0))
+                with st.expander("Breakdown by status"):
+                    for s, c in sorted(by_status.items()):
+                        st.write(f"- **{s}**: {c}")
+            except Exception as e:
+                st.error(f"Could not read CloudCall stats: {e}")
+
+            st.caption(
+                "**Unmapped** recordings are CloudCall calls whose user ID is not yet "
+                "linked to an app user. They will NOT show up in any recruiter's Call Log. "
+                "Add the missing mapping below, then click Re-import to backfill."
+            )
+            if st.button(
+                "Re-import Unmapped Recordings",
+                key="reimport_btn",
+                help="Scan for unmapped recordings whose CloudCall user is now mapped, and import them.",
+            ):
+                try:
+                    with st.spinner("Scanning and re-importing..."):
+                        result = reimport_unmapped_recordings()
+                    st.success(
+                        f"Scanned {result['scanned']} unmapped recording(s); "
+                        f"{result['mappable']} had a current mapping; "
+                        f"{result['succeeded']} imported successfully; "
+                        f"{result['failed']} failed."
+                    )
+                    logger.info(
+                        "Admin reimport: user_id=%d result=%s",
+                        current_user_id, result,
+                    )
+                    st.rerun()
+                except Exception as e:
+                    logger.error("Re-import failed: user_id=%d error=%s", current_user_id, e)
+                    st.error(f"Re-import failed: {e}")
 
         # --- CloudCall User Mappings ---
         if CLOUDCALL_ENABLED:
