@@ -3,56 +3,37 @@
 Each entry defines what a successful call of that type should cover. When a
 recruiter selects a call type and clicks "Analyze Call" on the Calls tab, the
 diarized transcript is graded against this template by an LLM, which mirrors
-the template's structure in its response.
+the template's structure in its response and includes the candidate's
+verbatim quotes from the transcript.
+
+Standard Call is included as a category but doesn't get a coaching evaluation —
+the transcript and Bullhorn-ready summary are sufficient for that call type.
 
 Editing templates:
 - Just edit the `template` string below — plain text or markdown both work.
-- The LLM follows the template's structure: if you use section headers (like
-  "Rate", "Logistics"), it uses those exact headers in its evaluation.
-- You can name custom sections like "OOPS Section" or "Technical Screening
-  Questions" with their own instructions; the LLM follows them.
-- After saving, the next "Analyze Call" click picks up the new template
-  immediately. No app restart required.
+- The LLM mirrors the template's structure in its output.
+- You can name custom sections like "OOPS Section" with their own instructions.
+- Streamlit auto-reloads on save; the next Analyze Call click picks up changes.
 """
 
 CALL_TEMPLATES = {
     "standard_call": {
         "label": "Standard Call",
         "template": """\
-PLACEHOLDER — replace with the OakTree Standard Call template.
+Standard Call — no coaching evaluation needed.
 
-Suggested points to cover:
-- Warm introduction and rapport-building
-- Confirm purpose of the call
-- Gather relevant information from the contact
-- Communicate clear next steps
-- Confirm timing/availability for any follow-up
-""",
-    },
-    "followup": {
-        "label": "Follow-up Call",
-        "template": """\
-PLACEHOLDER — replace with the OakTree Follow-up Call template.
+A standard recruiter call is any general conversation that doesn't fit a more
+specific category (screening, interview prep, post-interview rundown, etc.).
+The diarized transcript and the auto-generated Bullhorn-ready summary on the
+Calls tab are enough — no template-based evaluation is run for this call type.
 
-Suggested points to cover:
-- Reference the prior conversation
-- Update on any progress since last contact
-- Address any open questions from the previous call
-- Confirm next milestones
-- Schedule the next touchpoint
-""",
-    },
-    "coldcall": {
-        "label": "Cold Call",
-        "template": """\
-PLACEHOLDER — replace with the OakTree Cold Call template.
+Use this category for:
+- General check-ins with candidates or clients
+- Quick informational calls
+- Status updates that don't warrant a full coaching review
 
-Suggested points to cover:
-- Brief, compelling introduction (who you are, why you're calling)
-- Establish credibility / value proposition
-- Identify a pain point or need
-- Qualify level of interest
-- Either schedule a next step or close politely
+If a call should be evaluated, pick one of the other call types (Screening
+Call or Post Interview Rundown) instead.
 """,
     },
     "screening_call": {
@@ -111,78 +92,53 @@ Technical Screening Questions
 • List the question and answer for any technical questions the recruiter asks during the call that are not written above.
 """,
     },
-    "interview_prep": {
-        "label": "Interview Prep",
+    "post_interview_rundown": {
+        "label": "Post Interview Rundown",
         "template": """\
-Interview Logistics
-the recruiter should confirm (list the item within the response):
-• Date and time of the interview, including time zone
-• Total duration the candidate should plan for
-• Interview format – phone, video, or on-site
-• Platform and meeting link if virtual (Zoom, Teams, Google Meet, etc.)
-• Address and parking/check-in instructions if on-site
-• Dress code expectations for the format
+Interview Participants
+the recruiter should ask (list the question within the response):
+• Who was in the interview and what were their roles?
 
-Interviewer Information
-the recruiter should review (list the item within the response):
-• Full name and job title of each interviewer the candidate will meet
-• Each interviewer's role on the team and likely areas of focus
-• Background or specialty of each interviewer (where known)
-• Encourage the candidate to review each interviewer's LinkedIn profile beforehand
+Interview Dynamics
+the recruiter should ask (list the question within the response):
+• What was the mood of the interview?
+• Who did most of the talking?
 
-Company & Role Context
-the recruiter should cover (list the item within the response):
-• Brief company overview – what the company does and any recent news the candidate should know
-• Company culture, values, and work environment
-• The specific team the candidate would be joining and the reporting structure
-• Why this role exists and what success looks like in the first 30/60/90 days
-• Any context about the hiring manager's priorities for this hire
+Interview Structure
+the recruiter should ask (list the question within the response):
+• Was the interview a pre-determined list of questions or a free-flow conversation around resume and skills?
+• Did the interviewers ask behavioral or situational questions? If so, what were they?
 
-Likely Interview Questions
-the recruiter should prepare the candidate for (list the item within the response):
-• Common behavioral questions to expect – walk through the STAR method (Situation, Task, Action, Result)
-• Common technical or role-specific questions likely for this position
-• "Why are you leaving?" / "Why this role?" – help the candidate articulate clearly
-• Have the candidate think through 2-3 strong STAR examples that highlight relevant accomplishments
-• Anticipate questions about resume gaps, transitions, or unusual aspects of their work history
+Role-Specific Questions
+the recruiter should ask (list the question within the response):
+• Did the interviewers ask anything specifically about the role?
+• Technical questions about the role
+• Personality / fit questions
+• Team environment questions
 
-Questions for the Candidate to Ask
-the recruiter should suggest (list the item within the response):
-• At least 3 strong, role-specific questions the candidate should be ready to ask
-• A question about the team and day-to-day culture
-• A question about success metrics or what a strong first 90 days looks like
-• A question about next steps in the hiring process and timeline
+Process & Timeline
+the recruiter should ask (list the question within the response):
+• Was there discussion of next steps?
+• Did the interviewers mention other candidates they are considering?
+• Was a timeline discussed for a decision?
 
-Compensation & Expectations Alignment
-the recruiter should reconfirm (list the item within the response):
-• Reconfirm the agreed rate or salary range with the candidate
-• Confirm benefits expectations are aligned (insurance, PTO, remote flexibility, etc.)
-• Confirm preferred start date and any notice the candidate would need to give
-• Flag any open items that could come up (relocation, equipment, travel)
-• Reaffirm the candidate's interest level – are they fully committed to this opportunity?
+Candidate's Pipeline
+the recruiter should ask (list the question within the response):
+• Does the candidate have any other roles they are pursuing? If so, where are they in that process?
 
-Logistics Confirmation
-the recruiter should confirm (list the item within the response):
-• Candidate's availability at the scheduled time – any conflicts or PTO planned?
-• Technology check for virtual interviews – camera, microphone, internet, distraction-free environment
-• Travel arrangements for on-site interviews – does the candidate have what they need?
-• Backup plan if something goes wrong (alternate phone number, who to contact if late)
+Offer Readiness
+the recruiter should ask (list the question within the response):
+• If the client offers the candidate this role, are they ready to accept?
 
-Next Steps / Follow-up
-the recruiter should outline (list the item within the response):
-• Timeline for hearing back after the interview
-• Encourage the candidate to send a thank-you note or email within 24 hours
-• When the recruiter will follow up with the candidate after the interview
-• What the next round of the process looks like (additional interviews, references, offer)
-• Any additional materials needed from the candidate (work samples, references, etc.)
+Follow-up Coaching
+the recruiter should advise (list the item within the response):
+• Advise the candidate to send a thank-you email that the recruiter can forward to the account manager.
 
 OOPS Section
 • List any questions or items from the previous sections that the recruiter forgot to cover with the candidate.
 
-Coaching Notes
-• Highlight any additional points the recruiter made that were not in the template above.
-• Flag any moments where the candidate seemed unsure, hesitant, or under-prepared that the recruiter could revisit in a follow-up.
-• Note tone, rapport, and confidence observations briefly.
+Additional Notes
+• List any other notable details from the call that are not covered in the sections above.
 """,
     },
 }

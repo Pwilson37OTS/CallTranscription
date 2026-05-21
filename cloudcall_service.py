@@ -222,7 +222,7 @@ def download_recording(recording_url: str, cloudcall_recording_id: str) -> Path:
 def import_recording_to_pipeline(
     cloudcall_recording_db_id: int,
     user_id: int,
-    call_type: str = "general_recruiter_call",
+    call_type: str = "standard_call",
     metadata: Optional[Dict[str, Any]] = None,
 ) -> int:
     """Download, convert, and import a CloudCall recording into the calls table.
@@ -709,12 +709,18 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
         # in that recruiter's view without a manual import click.
         if recording_db_id and app_user_id:
             try:
+                # Prefer the contact name; fall back to the phone number when
+                # CloudCall didn't know the contact (cold call to unknown number).
+                # This drives the dropdown label in the Calls tab.
+                contact_label = (
+                    call.get("contact_name") or call.get("contact_number") or ""
+                ).strip()
                 import_recording_to_pipeline(
                     cloudcall_recording_db_id=recording_db_id,
                     user_id=app_user_id,
                     metadata={
                         "recruiter_name": call.get("user_name", ""),
-                        "subject_name": call.get("contact_name", ""),
+                        "subject_name": contact_label,
                     },
                 )
             except Exception as e:

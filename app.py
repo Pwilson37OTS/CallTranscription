@@ -299,14 +299,29 @@ with calls_tab:
         else:
             st.info("No calls available yet.")
     else:
-        # Dropdown selector
+        # Dropdown selector — labels match the Call Log style: Recruiter |
+        # Contact (name or phone) | Date & time in Central Time.
+        from zoneinfo import ZoneInfo as _ZI
+        _UTC_TZ = _ZI("UTC")
+        _CT_TZ = _ZI("America/Chicago")
+
         def _call_label(row) -> str:
-            who = row["subject_name"] or row["original_filename"] or "Unknown"
+            recruiter = (row["recruiter_name"] or "").strip() or "—"
+            contact = (row["subject_name"] or "").strip()
+            if not contact:
+                # Fall back to a readable identifier if subject_name is blank
+                # (older imports may not have the phone-number fallback).
+                of = row["original_filename"] or ""
+                contact = of if of and not of.startswith("cloudcall_") else "Unknown contact"
             try:
-                dt = datetime.fromisoformat(row["created_at"]).strftime("%b %d, %I:%M %p")
+                dt = datetime.fromisoformat(row["created_at"])
+                if dt.tzinfo is None:
+                    dt = dt.replace(tzinfo=_UTC_TZ)
+                dt_ct = dt.astimezone(_CT_TZ)
+                dt_str = dt_ct.strftime("%b %d, %I:%M %p CT")
             except Exception:
-                dt = (row["created_at"] or "")[:16]
-            return f"#{row['id']} | {who} | {dt}"
+                dt_str = (row["created_at"] or "")[:16]
+            return f"{recruiter} | {contact} | {dt_str}"
 
         options = {_call_label(row): row["id"] for row in calls}
         selected_label = st.selectbox("Select a call", list(options.keys()))
@@ -445,14 +460,31 @@ with calls_tab:
                     index=default_idx,
                     key=f"coach_type_{call['id']}",
                 )
+
+            # Standard Call doesn't get evaluated — the transcript and summary
+            # are sufficient. Show that explicitly and don't surface the
+            # Analyze button for that call type.
+            is_standard_call = selected_call_type == "standard_call"
+
             with coach_right:
                 st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-                analyze_clicked = st.button(
-                    "Analyze Call",
-                    key=f"analyze_{call['id']}",
-                    use_container_width=True,
-                    disabled=not call["transcript_text"],
-                    help="Compare the transcript against the template for the selected call type.",
+                if is_standard_call:
+                    analyze_clicked = False
+                else:
+                    analyze_clicked = st.button(
+                        "Analyze Call",
+                        key=f"analyze_{call['id']}",
+                        use_container_width=True,
+                        disabled=not call["transcript_text"],
+                        help="Compare the transcript against the template for the selected call type.",
+                    )
+
+            if is_standard_call:
+                st.info(
+                    "Standard calls don't get a coaching evaluation. The "
+                    "transcript and Bullhorn-ready summary above are enough. "
+                    "Switch to **Screening Call** or **Post Interview Rundown** "
+                    "if you'd like this call evaluated."
                 )
 
             if analyze_clicked:
@@ -509,9 +541,9 @@ with calls_tab:
                         )
                         st.error(f"Analysis failed: {e}")
 
-            if call["summary_text"]:
+            if call["summary_text"] and not is_standard_call:
                 st.markdown(call["summary_text"])
-            else:
+            elif not is_standard_call:
                 st.caption(
                     "_No analysis yet for this call. Pick a call type above and "
                     "click Analyze Call._"
@@ -693,8 +725,9 @@ if admin_tab is not None:
         st.markdown("### User Management")
         users = get_all_users()
         if users:
+            from auth import hash_password as _hash_password
             for u in users:
-                col_name, col_email, col_role, col_status, col_action = st.columns([2, 3, 1, 1, 2])
+                col_name, col_email, col_role, col_status, col_action = st.columns([2, 3, 1, 1, 3])
                 with col_name:
                     st.write(u["display_name"])
                 with col_email:
@@ -705,14 +738,58 @@ if admin_tab is not None:
                     st.write("Active" if u["is_active"] else "Inactive")
                 with col_action:
                     if u["id"] != current_user_id:
-                        if u["is_active"]:
-                            if st.button("Deactivate", key=f"deact_{u['id']}"):
-                                update_user(u["id"], is_active=0)
+                        action_a, action_b = st.columns(2)
+                        with action_a:
+                            if u["is_active"]:
+                                if st.button("Deactivate", key=f"deact_{u['id']}", use_container_width=True):
+                                    update_user(u["id"], is_active=0)
+                                    st.rerun()
+                            else:
+                                if st.button("Activate", key=f"act_{u['id']}", use_container_width=True):
+                                    update_user(u["id"], is_active=1)
+                                    st.rerun()
+                        with action_b:
+                            if st.button("Change Password", key=f"changepw_btn_{u['id']}", use_container_width=True):
+                                # Toggle the inline form for this user
+                                key = f"_pw_edit_{u['id']}"
+                                st.session_state[key] = not st.session_state.get(key, False)
                                 st.rerun()
-                        else:
-                            if st.button("Activate", key=f"act_{u['id']}"):
-                                update_user(u["id"], is_active=1)
+
+                # Inline password reset form, shown only when toggled for this user
+                if u["id"] != current_user_id and st.session_state.get(f"_pw_edit_{u['id']}", False):
+                    with st.form(f"pw_form_{u['id']}"):
+                        st.markdown(f"**Reset password for {u['email']}**")
+                        new_pw = st.text_input(
+                            "New password", type="password", key=f"newpw_input_{u['id']}"
+                        )
+                        confirm_pw = st.text_input(
+                            "Confirm password", type="password", key=f"confirmpw_input_{u['id']}"
+                        )
+                        pw_btn_cols = st.columns([1, 1, 4])
+                        with pw_btn_cols[0]:
+                            save_pw = st.form_submit_button("Save", use_container_width=True)
+                        with pw_btn_cols[1]:
+                            cancel_pw = st.form_submit_button("Cancel", use_container_width=True)
+
+                        if save_pw:
+                            if not new_pw:
+                                st.error("New password is required.")
+                            elif len(new_pw) < 6:
+                                st.error("Password must be at least 6 characters.")
+                            elif new_pw != confirm_pw:
+                                st.error("Passwords do not match.")
+                            else:
+                                update_user(u["id"], password_hash=_hash_password(new_pw))
+                                logger.info(
+                                    "Admin password reset: target_user_id=%d by user_id=%d",
+                                    u["id"], current_user_id,
+                                )
+                                st.success(f"Password reset for {u['email']}.")
+                                st.session_state[f"_pw_edit_{u['id']}"] = False
                                 st.rerun()
+                        elif cancel_pw:
+                            st.session_state[f"_pw_edit_{u['id']}"] = False
+                            st.rerun()
 
         st.markdown("---")
         st.markdown("### Create New User")
@@ -952,7 +1029,7 @@ if admin_tab is not None:
                             "subject_name": up_subject,
                             "company_name": up_company,
                             "notes": up_notes,
-                            "call_type": "general_recruiter_call",
+                            "call_type": "standard_call",
                             "status": "uploaded",
                             "transcript_text": None,
                             "summary_text": None,
