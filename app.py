@@ -448,47 +448,146 @@ with calls_tab:
 # -----------------------------
 with log_tab:
     st.subheader("Call Log")
-    st.caption("History of all your calls with audio and transcripts. No actions — use the Calls tab to process or submit.")
+    st.caption(
+        "CloudCall recordings from the last 72 hours. "
+        + ("Admin view — showing calls across all users." if user_is_admin
+           else "Showing only calls associated with your CloudCall account.")
+    )
 
-    log_calls = get_all_calls(user_id=query_user_id)
-    if not log_calls:
-        st.info("No calls in your log yet.")
+    if not CLOUDCALL_ENABLED:
+        st.info("CloudCall integration is not enabled.")
     else:
-        for row in log_calls:
-            try:
-                dt_short = datetime.fromisoformat(row["created_at"]).strftime("%b %d, %Y %I:%M %p")
-            except Exception:
-                dt_short = (row["created_at"] or "")[:16]
-            who = row["subject_name"] or row["original_filename"] or "Unknown"
-            status_pretty = (row["status"] or "").replace("_", " ").title()
+        from cloudcall_db import get_cloudcall_recordings as _get_cc_recs
+        from cloudcall_service import import_recording_to_pipeline as _import_recording
+        from zoneinfo import ZoneInfo as _ZoneInfo
 
-            with st.expander(f"#{row['id']} | {who} | {dt_short} | {status_pretty}"):
-                cols = st.columns([1, 2])
-                with cols[0]:
-                    st.write(f"**Contact:** {row['subject_name'] or '—'}")
-                    st.write(f"**Recruiter:** {row['recruiter_name'] or '—'}")
-                    st.write(f"**Status:** {status_pretty}")
-                    ap = storage.resolve(row["stored_path"])
-                    if ap.exists():
-                        st.audio(str(ap))
-                    else:
-                        st.caption("_Audio file not found in storage._")
-                with cols[1]:
-                    if row["transcript_text"]:
-                        st.text_area(
-                            "Transcript",
-                            value=row["transcript_text"],
-                            height=260,
-                            disabled=True,
-                            key=f"log_t_{row['id']}",
-                            label_visibility="collapsed",
-                        )
-                    else:
-                        st.caption("_Transcript not yet generated. Open this call on the Calls tab to transcribe it._")
+        _CT = _ZoneInfo("America/Chicago")
+        _UTC = _ZoneInfo("UTC")
 
-                if row["summary_text"]:
-                    st.markdown("**Coaching Analysis**")
-                    st.markdown(row["summary_text"])
+        # Admins see every recording; non-admins are filtered by app_user_id
+        # (set when the poller matches a CloudCall user mapping). Recordings
+        # without a mapping are invisible to non-admins by design.
+        log_scope_user_id = None if user_is_admin else current_user_id
+        recordings = _get_cc_recs(user_id=log_scope_user_id, hours=72)
+
+        if not recordings:
+            st.info("No CloudCall recordings in the last 72 hours.")
+        else:
+            def _fmt_length(secs):
+                if secs is None:
+                    return "—"
+                try:
+                    secs = int(secs)
+                except (TypeError, ValueError):
+                    return "—"
+                if secs < 60:
+                    return f"{secs}s"
+                if secs < 3600:
+                    m, s = divmod(secs, 60)
+                    return f"{m}m {s}s"
+                h, rem = divmod(secs, 3600)
+                m = rem // 60
+                return f"{h}h {m}m"
+
+            # Column layout (must match between header and body rows)
+            col_widths = [1.8, 0.8, 1.8, 2.2, 0.9, 1.1, 1.1]
+
+            hdr = st.columns(col_widths)
+            hdr[0].markdown("**Date / Time (CT)**")
+            hdr[1].markdown("**Length**")
+            hdr[2].markdown("**Recruiter**")
+            hdr[3].markdown("**Contact**")
+            hdr[4].markdown("**Direction**")
+            hdr[5].markdown("**Status**")
+            hdr[6].markdown("**Import**")
+            st.divider()
+
+            for r in recordings:
+                row = st.columns(col_widths)
+
+                # Date / time in Central
+                with row[0]:
+                    try:
+                        ts = datetime.fromisoformat((r["call_timestamp"] or "").replace(" ", "T"))
+                        if ts.tzinfo is None:
+                            ts = ts.replace(tzinfo=_UTC)
+                        ts_ct = ts.astimezone(_CT)
+                        st.write(ts_ct.strftime("%b %d, %I:%M %p"))
+                    except Exception:
+                        st.write((r["call_timestamp"] or "")[:16])
+
+                # Length
+                with row[1]:
+                    st.write(_fmt_length(r["call_duration_seconds"]))
+
+                # Recruiter
+                with row[2]:
+                    st.write(r["recruiter_name"] or r["caller_number"] or "—")
+
+                # Contact (name + number when available)
+                with row[3]:
+                    contact = r["contact_name"] or ""
+                    number = r["callee_number"] or ""
+                    if contact and number:
+                        st.write(f"{contact} ({number})")
+                    elif contact:
+                        st.write(contact)
+                    elif number:
+                        st.write(number)
+                    else:
+                        st.write("—")
+
+                # Direction
+                with row[4]:
+                    st.write(r["direction"] or "—")
+
+                # Status
+                with row[5]:
+                    status = (r["status"] or "").lower()
+                    if status == "imported":
+                        st.write("✓ Imported")
+                    elif status == "error":
+                        err_msg = r["error_message"] if "error_message" in r.keys() else ""
+                        st.write("⚠ Error")
+                        if err_msg:
+                            st.caption(err_msg[:80] + ("…" if len(err_msg) > 80 else ""))
+                    elif status == "importing":
+                        st.write("Importing…")
+                    else:
+                        st.write(status.title() if status else "—")
+
+                # Import action
+                with row[6]:
+                    importable = status in ("available", "error")
+                    target_user_id = r["app_user_id"]
+                    if importable and target_user_id is None:
+                        st.caption("_Needs mapping_")
+                    elif importable:
+                        if st.button("Import", key=f"log_import_{r['id']}", use_container_width=True):
+                            try:
+                                with st.spinner("Importing…"):
+                                    new_call_id = _import_recording(
+                                        cloudcall_recording_db_id=r["id"],
+                                        user_id=target_user_id,
+                                        metadata={
+                                            "recruiter_name": r["recruiter_name"] or "",
+                                            "subject_name": r["contact_name"] or "",
+                                        },
+                                    )
+                                st.success(f"Imported as call #{new_call_id}.")
+                                logger.info(
+                                    "Manual import (Call Log): user_id=%d recording_id=%d call_id=%d",
+                                    current_user_id, r["id"], new_call_id,
+                                )
+                                st.rerun()
+                            except Exception as e:
+                                logger.error(
+                                    "Manual import failed (Call Log): user_id=%d recording_id=%d error=%s",
+                                    current_user_id, r["id"], e,
+                                )
+                                st.error(f"Failed: {e}")
+                    else:
+                        st.write("—")
 
 
 # -----------------------------
@@ -798,43 +897,6 @@ if admin_tab is not None:
                         if not ffmpeg_available():
                             st.info("Install ffmpeg, then restart Streamlit. Windows: `winget install Gyan.FFmpeg`")
 
-        # --- CloudCall Raw Inbox (admin troubleshooting) ---
-        if CLOUDCALL_ENABLED:
-            from cloudcall_db import (
-                get_cloudcall_recordings,
-                get_cloudcall_recording,
-                update_cloudcall_recording,
-            )
-            from cloudcall_service import import_recording_to_pipeline, maybe_cleanup_expired
-
-            maybe_cleanup_expired()
-
-            st.markdown("---")
-            st.markdown("### CloudCall Raw Inbox")
-            st.caption(
-                "Recordings polled from CloudCall in the last 72 hours. Mapped recordings are auto-imported. "
-                "Use this section to troubleshoot unmapped or failed imports."
-            )
-
-            inbox = get_cloudcall_recordings(user_id=None, hours=72)
-            if not inbox:
-                st.info("No CloudCall recordings in the last 72 hours.")
-            else:
-                import pandas as pd
-                rows = []
-                for r in inbox:
-                    try:
-                        ts = datetime.fromisoformat((r["call_timestamp"] or "").replace(" ", "T")).strftime("%b %d %I:%M %p")
-                    except Exception:
-                        ts = (r["call_timestamp"] or "")[:16]
-                    rows.append({
-                        "Date": ts,
-                        "CC User": r["cloudcall_user_id"] or "—",
-                        "Recruiter": r["recruiter_name"] or "—",
-                        "Contact": r["contact_name"] or r["callee_number"] or "—",
-                        "Direction": r["direction"] or "—",
-                        "Status": r["status"],
-                        "Call ID": r["imported_call_id"] if "imported_call_id" in r.keys() else None,
-                        "Error": (r["error_message"] or "") if "error_message" in r.keys() else "",
-                    })
-                st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+        # The full per-row CloudCall inbox now lives on the Call Log tab
+        # (admins see all calls there). The high-level ingest counts above
+        # cover what this Admin section used to show.
