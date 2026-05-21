@@ -84,6 +84,60 @@ def diarize_transcript(
     return result
 
 
+def summarize_call(
+    transcript_text: str,
+    metadata: Dict[str, Any],
+    model: str = "gpt-4.1",
+) -> str:
+    """Generate a concise, Bullhorn-ready summary of the call.
+
+    The output is designed to be pasted directly into Bullhorn as a note.
+    Three short sections: Call Summary, Key Points, Next Steps. Facts only —
+    no speculation, no invention.
+    """
+    logger.info("Call summary started: model=%s chars=%d", model, len(transcript_text))
+
+    recruiter = (metadata.get("recruiter_name") or "").strip() or "the recruiter"
+    subject = (metadata.get("subject_name") or "").strip() or "the contact"
+
+    system_prompt = (
+        "You are a staffing recruiter assistant. The user will give you a "
+        "transcript of a phone call. Your job is to produce a concise, "
+        "factual summary that the recruiter can paste into Bullhorn as a "
+        "note. Stay grounded in the transcript — do not invent details, "
+        "speculate, or pad. Keep it tight."
+    )
+
+    user_prompt = (
+        f"Recruiter: {recruiter}\n"
+        f"Contact: {subject}\n\n"
+        "Generate a Bullhorn-ready note using this exact structure. "
+        "Omit any section that genuinely wasn't discussed:\n\n"
+        "**Call Summary**\n"
+        "[2-3 sentence overview of who spoke, why, and the overall outcome.]\n\n"
+        "**Key Points**\n"
+        "- [Most important facts the contact shared — role, availability, comp expectations, concerns, etc.]\n"
+        "- [Use as many bullets as needed; keep each one to a single line.]\n\n"
+        "**Next Steps**\n"
+        "- [Concrete follow-ups agreed to on the call, with owner if mentioned.]\n\n"
+        "Write in plain prose — no preamble, no apology, no recap of the instructions. "
+        "Start directly with the **Call Summary** header.\n\n"
+        f"TRANSCRIPT:\n{transcript_text}"
+    )
+
+    client = get_openai_client()
+    response = client.chat.completions.create(
+        model=model,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    result = response.choices[0].message.content.strip()
+    logger.info("Call summary complete: model=%s chars=%d", model, len(result))
+    return result
+
+
 def analyze_call(
     transcript_text: str,
     call_type_label: str,

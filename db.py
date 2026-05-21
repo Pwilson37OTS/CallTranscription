@@ -52,12 +52,20 @@ def init_db() -> None:
                 status TEXT DEFAULT 'uploaded',
                 transcript_text TEXT,
                 summary_text TEXT,
+                call_summary TEXT,
                 transcription_model TEXT,
                 summary_model TEXT,
                 user_id INTEGER REFERENCES users(id)
             )
             """
         )
+        # Idempotent migration for installs created before call_summary existed.
+        # summary_text continues to hold the coaching analysis; call_summary is
+        # the Bullhorn-ready note generated alongside the transcript.
+        try:
+            conn.execute("ALTER TABLE calls ADD COLUMN call_summary TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS api_usage (
@@ -184,8 +192,8 @@ def insert_call(record: Dict[str, Any]) -> int:
 
 _ALLOWED_COLUMNS = {
     "recruiter_name", "subject_name", "company_name", "notes", "call_type",
-    "status", "transcript_text", "summary_text", "transcription_model",
-    "summary_model", "user_id",
+    "status", "transcript_text", "summary_text", "call_summary",
+    "transcription_model", "summary_model", "user_id",
 }
 
 

@@ -11,7 +11,7 @@ from db import (
     init_db, insert_call, update_call, get_all_calls, get_call,
     insert_api_usage, get_all_users, get_usage_summary, update_user,
 )
-from openai_service import transcribe_audio, diarize_transcript, analyze_call
+from openai_service import transcribe_audio, diarize_transcript, analyze_call, summarize_call
 from call_templates import CALL_TEMPLATES
 from file_service import save_uploaded_file, ffmpeg_available
 from auth import (
@@ -207,6 +207,45 @@ def ensure_transcript(call) -> str:
     return labeled
 
 
+def ensure_summary(call, transcript_text: str) -> str:
+    """Return the Bullhorn-ready summary for a call, generating it if needed."""
+    if call["call_summary"]:
+        return call["call_summary"]
+
+    if not transcript_text:
+        raise RuntimeError("Transcript is required before generating a summary.")
+
+    if not _check_rate_limit(current_user_id):
+        raise RuntimeError(
+            f"Rate limit exceeded ({RATE_LIMIT_PER_HOUR} API calls/hour). Please wait."
+        )
+
+    logger.info("Auto-summary started: user_id=%d call_id=%d", current_user_id, call["id"])
+
+    with st.spinner("Generating Bullhorn-ready summary..."):
+        summary = summarize_call(
+            transcript_text=transcript_text,
+            metadata={
+                "recruiter_name": call["recruiter_name"],
+                "subject_name": call["subject_name"],
+            },
+            model=DEFAULT_DIARIZATION_MODEL,
+        )
+
+    _record_api_call(current_user_id)
+    insert_api_usage({
+        "user_id": current_user_id,
+        "call_id": call["id"],
+        "operation": "summary",
+        "model": DEFAULT_DIARIZATION_MODEL,
+        "estimated_cost_cents": 0,
+        "created_at": datetime.utcnow().isoformat(),
+    })
+    update_call(call["id"], call_summary=summary)
+    logger.info("Auto-summary complete: user_id=%d call_id=%d", current_user_id, call["id"])
+    return summary
+
+
 # -----------------------------
 # Tabs
 # -----------------------------
@@ -324,13 +363,15 @@ with calls_tab:
                         st.rerun()
 
             with right:
+                # Transcript (read-only, scrollable)
                 st.markdown("### Transcript")
+                transcript_text = None
                 try:
                     transcript_text = ensure_transcript(call)
                     st.text_area(
                         "Transcript",
                         value=transcript_text,
-                        height=520,
+                        height=260,
                         disabled=True,
                         label_visibility="collapsed",
                         key=f"transcript_view_{call['id']}",
@@ -343,6 +384,40 @@ with calls_tab:
                     st.error(f"Transcription failed: {e}")
                     if st.button("Retry Transcription", key=f"retry_{call['id']}"):
                         st.rerun()
+
+                # Bullhorn-ready summary (auto-generated after transcript exists,
+                # read-only, scrollable, copy via highlight-and-Ctrl+C). This
+                # is the interim path until the Submit to Bullhorn button
+                # lands in Phase 2 — recruiters paste this into Bullhorn manually.
+                st.markdown("### Bullhorn-Ready Summary")
+                st.caption(
+                    "Auto-generated from the transcript. Read-only — copy from "
+                    "the box and paste into Bullhorn as the note body."
+                )
+                if transcript_text:
+                    # Refetch call to pick up call_summary if it was just written
+                    # to the DB on a prior rerun.
+                    fresh = get_call(call["id"], user_id=query_user_id)
+                    try:
+                        summary_text = ensure_summary(fresh, transcript_text)
+                        st.text_area(
+                            "Summary",
+                            value=summary_text,
+                            height=260,
+                            disabled=True,
+                            label_visibility="collapsed",
+                            key=f"summary_view_{call['id']}",
+                        )
+                    except Exception as e:
+                        logger.error(
+                            "Auto-summary failed: user_id=%d call_id=%d error=%s",
+                            current_user_id, call["id"], e,
+                        )
+                        st.error(f"Summary failed: {e}")
+                        if st.button("Retry Summary", key=f"retry_summary_{call['id']}"):
+                            st.rerun()
+                else:
+                    st.caption("_Waiting for transcript before the summary can be generated._")
 
             # -------------------------
             # Call Coaching section
