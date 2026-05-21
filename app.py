@@ -11,7 +11,7 @@ from db import (
     init_db, insert_call, update_call, get_all_calls, get_call,
     insert_api_usage, get_all_users, get_usage_summary, update_user,
 )
-from openai_service import transcribe_audio, diarize_transcript, analyze_call, summarize_call
+from openai_service import transcribe_audio, diarize_transcript, analyze_call
 from call_templates import CALL_TEMPLATES
 from file_service import save_uploaded_file, ffmpeg_available
 from auth import (
@@ -207,56 +207,23 @@ def ensure_transcript(call) -> str:
     return labeled
 
 
-def ensure_summary(call, transcript_text: str) -> str:
-    """Return the Bullhorn-ready summary for a call, generating it if needed."""
-    if call["call_summary"]:
-        return call["call_summary"]
-
-    if not transcript_text:
-        raise RuntimeError("Transcript is required before generating a summary.")
-
-    if not _check_rate_limit(current_user_id):
-        raise RuntimeError(
-            f"Rate limit exceeded ({RATE_LIMIT_PER_HOUR} API calls/hour). Please wait."
-        )
-
-    logger.info("Auto-summary started: user_id=%d call_id=%d", current_user_id, call["id"])
-
-    with st.spinner("Generating Bullhorn-ready summary..."):
-        summary = summarize_call(
-            transcript_text=transcript_text,
-            metadata={
-                "recruiter_name": call["recruiter_name"],
-                "subject_name": call["subject_name"],
-            },
-            model=DEFAULT_DIARIZATION_MODEL,
-        )
-
-    _record_api_call(current_user_id)
-    insert_api_usage({
-        "user_id": current_user_id,
-        "call_id": call["id"],
-        "operation": "summary",
-        "model": DEFAULT_DIARIZATION_MODEL,
-        "estimated_cost_cents": 0,
-        "created_at": datetime.utcnow().isoformat(),
-    })
-    update_call(call["id"], call_summary=summary)
-    logger.info("Auto-summary complete: user_id=%d call_id=%d", current_user_id, call["id"])
-    return summary
+# Note: ensure_summary / summarize_call were removed from the UI per user
+# feedback. The summarize_call function and call_summary DB column are
+# still in place so the Bullhorn-ready summary can be re-enabled cheaply
+# if needed later.
 
 
 # -----------------------------
 # Tabs
 # -----------------------------
-tab_names = ["Calls", "Call Log", "Templates"]
+tab_names = ["Calls", "Call Log"]
 if user_is_admin:
-    tab_names.append("Admin")
+    tab_names.extend(["Templates", "Admin"])
 
 tabs = st.tabs(tab_names)
 calls_tab = tabs[0]
 log_tab = tabs[1]
-templates_tab = tabs[2]
+templates_tab = tabs[2] if user_is_admin else None
 admin_tab = tabs[3] if user_is_admin else None
 
 
@@ -264,38 +231,18 @@ admin_tab = tabs[3] if user_is_admin else None
 # Calls tab (main workflow)
 # -----------------------------
 with calls_tab:
-    # Header row with refresh button (when CloudCall enabled)
-    if CLOUDCALL_ENABLED:
-        col_title, col_refresh = st.columns([4, 1])
-        with col_title:
-            st.subheader("Process a Call")
-        with col_refresh:
-            if st.button(
-                "Pull from CloudCall",
-                key="main_refresh",
-                help="Check CloudCall for any new recordings from the last 72 hours.",
-            ):
-                try:
-                    from cloudcall_service import poll_recent_recordings
-                    with st.spinner("Checking CloudCall for new recordings..."):
-                        n = poll_recent_recordings(lookback_minutes=72 * 60)
-                    if n > 0:
-                        st.success(f"Found {n} new recording(s).")
-                    else:
-                        st.info("No new recordings found.")
-                    logger.info("CloudCall refresh: user_id=%d inserted=%d", current_user_id, n)
-                    st.rerun()
-                except Exception as e:
-                    logger.error("CloudCall refresh failed: user_id=%d error=%s", current_user_id, e)
-                    st.error(f"Refresh failed: {e}")
-    else:
-        st.subheader("Process a Call")
+    st.subheader("Process a Call")
+
+    # Reserve a slot at the top of the page for the Call Coaching section.
+    # We render it later in the script (after we know which call is selected)
+    # but it displays here, above the call selector.
+    coaching_container = st.container()
 
     calls = get_all_calls(user_id=query_user_id)
 
     if not calls:
         if CLOUDCALL_ENABLED:
-            st.info("No calls available yet. Click **Pull from CloudCall** above to fetch recent recordings.")
+            st.info("No calls available yet. Use **Pull from CloudCall** on the Call Log tab to fetch recent recordings.")
         else:
             st.info("No calls available yet.")
     else:
@@ -329,6 +276,64 @@ with calls_tab:
         call = get_call(selected_id, user_id=query_user_id)
 
         if call:
+            # -------------------------
+            # Call Coaching section — rendered AT THE TOP via the container
+            # reserved before the dropdown. Defined here (after the call is
+            # known) so the call-type default reflects the current call.
+            # -------------------------
+            coach_options = list(CALL_TEMPLATES.keys())
+            default_idx = (
+                coach_options.index(call["call_type"])
+                if call["call_type"] in coach_options
+                else 0
+            )
+            with coaching_container:
+                st.markdown("### Call Coaching")
+
+                coach_left, coach_right = st.columns([3, 1])
+                with coach_left:
+                    selected_call_type = st.selectbox(
+                        "Call Type",
+                        options=coach_options,
+                        format_func=lambda k: CALL_TEMPLATES[k]["label"],
+                        index=default_idx,
+                        key=f"coach_type_{call['id']}",
+                    )
+
+                is_standard_call = selected_call_type == "standard_call"
+
+                with coach_right:
+                    st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+                    if is_standard_call:
+                        analyze_clicked = False
+                    else:
+                        analyze_clicked = st.button(
+                            "Analyze Call",
+                            key=f"analyze_{call['id']}",
+                            use_container_width=True,
+                            disabled=not call["transcript_text"],
+                            help="Run a template-based coaching evaluation on the transcript.",
+                        )
+
+                if is_standard_call:
+                    st.info(
+                        "Standard calls don't get a coaching evaluation. Use the "
+                        "transcript below for your Bullhorn note. Switch to "
+                        "**Screening Call** or **Post Interview Rundown** if you "
+                        "want this call evaluated."
+                    )
+                else:
+                    st.caption(
+                        "Click **Analyze Call** once the transcript is ready to "
+                        "run a coaching evaluation against the template. Results "
+                        "appear at the bottom of the page."
+                    )
+
+                st.markdown("---")
+
+            # -------------------------
+            # Call details + transcript
+            # -------------------------
             left, right = st.columns([1, 2])
 
             with left:
@@ -378,15 +383,17 @@ with calls_tab:
                         st.rerun()
 
             with right:
-                # Transcript (read-only, scrollable)
+                # Transcript only. The Bullhorn-Ready Summary section was
+                # removed per user feedback — recruiters use the transcript
+                # directly for Standard Calls and the coaching analysis (below
+                # the columns) for Screening / Post Interview calls.
                 st.markdown("### Transcript")
-                transcript_text = None
                 try:
                     transcript_text = ensure_transcript(call)
                     st.text_area(
                         "Transcript",
                         value=transcript_text,
-                        height=260,
+                        height=520,
                         disabled=True,
                         label_visibility="collapsed",
                         key=f"transcript_view_{call['id']}",
@@ -400,93 +407,10 @@ with calls_tab:
                     if st.button("Retry Transcription", key=f"retry_{call['id']}"):
                         st.rerun()
 
-                # Bullhorn-ready summary (auto-generated after transcript exists,
-                # read-only, scrollable, copy via highlight-and-Ctrl+C). This
-                # is the interim path until the Submit to Bullhorn button
-                # lands in Phase 2 — recruiters paste this into Bullhorn manually.
-                st.markdown("### Bullhorn-Ready Summary")
-                st.caption(
-                    "Auto-generated from the transcript. Read-only — copy from "
-                    "the box and paste into Bullhorn as the note body."
-                )
-                if transcript_text:
-                    # Refetch call to pick up call_summary if it was just written
-                    # to the DB on a prior rerun.
-                    fresh = get_call(call["id"], user_id=query_user_id)
-                    try:
-                        summary_text = ensure_summary(fresh, transcript_text)
-                        st.text_area(
-                            "Summary",
-                            value=summary_text,
-                            height=260,
-                            disabled=True,
-                            label_visibility="collapsed",
-                            key=f"summary_view_{call['id']}",
-                        )
-                    except Exception as e:
-                        logger.error(
-                            "Auto-summary failed: user_id=%d call_id=%d error=%s",
-                            current_user_id, call["id"], e,
-                        )
-                        st.error(f"Summary failed: {e}")
-                        if st.button("Retry Summary", key=f"retry_summary_{call['id']}"):
-                            st.rerun()
-                else:
-                    st.caption("_Waiting for transcript before the summary can be generated._")
-
             # -------------------------
-            # Call Coaching section
+            # Analyze action (triggered by the button up top in the coaching
+            # container). Output renders below the columns.
             # -------------------------
-            st.markdown("---")
-            st.markdown("### Call Coaching")
-            st.caption(
-                "Pick the type of call and click Analyze to evaluate how well the "
-                "transcript matched the template for that call type."
-            )
-
-            coach_options = list(CALL_TEMPLATES.keys())
-            default_idx = (
-                coach_options.index(call["call_type"])
-                if call["call_type"] in coach_options
-                else 0
-            )
-
-            coach_left, coach_right = st.columns([3, 1])
-            with coach_left:
-                selected_call_type = st.selectbox(
-                    "Call Type",
-                    options=coach_options,
-                    format_func=lambda k: CALL_TEMPLATES[k]["label"],
-                    index=default_idx,
-                    key=f"coach_type_{call['id']}",
-                )
-
-            # Standard Call doesn't get evaluated — the transcript and summary
-            # are sufficient. Show that explicitly and don't surface the
-            # Analyze button for that call type.
-            is_standard_call = selected_call_type == "standard_call"
-
-            with coach_right:
-                st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-                if is_standard_call:
-                    analyze_clicked = False
-                else:
-                    analyze_clicked = st.button(
-                        "Analyze Call",
-                        key=f"analyze_{call['id']}",
-                        use_container_width=True,
-                        disabled=not call["transcript_text"],
-                        help="Compare the transcript against the template for the selected call type.",
-                    )
-
-            if is_standard_call:
-                st.info(
-                    "Standard calls don't get a coaching evaluation. The "
-                    "transcript and Bullhorn-ready summary above are enough. "
-                    "Switch to **Screening Call** or **Post Interview Rundown** "
-                    "if you'd like this call evaluated."
-                )
-
             if analyze_clicked:
                 if not _check_rate_limit(current_user_id):
                     st.error(
@@ -511,7 +435,6 @@ with calls_tab:
                                 },
                                 model=DEFAULT_DIARIZATION_MODEL,
                             )
-                        # Tag the saved analysis with which call type it was run against
                         stored_analysis = (
                             f"_Analyzed as: **{template_cfg['label']}**_\n\n{analysis_text}"
                         )
@@ -541,20 +464,52 @@ with calls_tab:
                         )
                         st.error(f"Analysis failed: {e}")
 
-            if call["summary_text"] and not is_standard_call:
-                st.markdown(call["summary_text"])
-            elif not is_standard_call:
-                st.caption(
-                    "_No analysis yet for this call. Pick a call type above and "
-                    "click Analyze Call._"
-                )
+            # -------------------------
+            # Coaching analysis output AT THE BOTTOM (for non-standard types)
+            # -------------------------
+            if not is_standard_call:
+                st.markdown("---")
+                st.markdown("### Call Analysis")
+                if call["summary_text"]:
+                    st.markdown(call["summary_text"])
+                else:
+                    st.caption(
+                        "_No analysis yet for this call. Click **Analyze Call** "
+                        "above to generate one._"
+                    )
 
 
 # -----------------------------
 # Call Log tab (history view, no actions)
 # -----------------------------
 with log_tab:
-    st.subheader("Call Log")
+    # Header row: title + Pull from CloudCall button (moved from Calls tab)
+    if CLOUDCALL_ENABLED:
+        log_col_title, log_col_refresh = st.columns([4, 1])
+        with log_col_title:
+            st.subheader("Call Log")
+        with log_col_refresh:
+            if st.button(
+                "Pull from CloudCall",
+                key="log_refresh",
+                help="Check CloudCall for any new recordings from the last 72 hours.",
+            ):
+                try:
+                    from cloudcall_service import poll_recent_recordings
+                    with st.spinner("Checking CloudCall for new recordings..."):
+                        n = poll_recent_recordings(lookback_minutes=72 * 60)
+                    if n > 0:
+                        st.success(f"Found {n} new recording(s).")
+                    else:
+                        st.info("No new recordings found.")
+                    logger.info("CloudCall refresh: user_id=%d inserted=%d", current_user_id, n)
+                    st.rerun()
+                except Exception as e:
+                    logger.error("CloudCall refresh failed: user_id=%d error=%s", current_user_id, e)
+                    st.error(f"Refresh failed: {e}")
+    else:
+        st.subheader("Call Log")
+
     st.caption(
         "CloudCall recordings from the last 72 hours. "
         + ("Admin view — showing calls across all users." if user_is_admin
@@ -698,20 +653,22 @@ with log_tab:
 
 
 # -----------------------------
-# Templates tab (reference view)
+# Templates tab (admin-only reference view)
 # -----------------------------
-with templates_tab:
-    st.subheader("Call Templates")
-    st.caption(
-        "These are the templates the Analyze Call feature evaluates transcripts "
-        "against. Use this tab to review what each call type should cover — "
-        "pull it up before or during a call as a reference."
-    )
+if templates_tab is not None:
+    with templates_tab:
+        st.subheader("Call Templates")
+        st.caption(
+            "Admin-only view of the templates the Analyze Call feature evaluates "
+            "transcripts against. To edit a template, modify call_templates.py "
+            "in the repo and redeploy — Streamlit picks up changes on the next "
+            "container start."
+        )
 
-    # Default-open the first one so the page lands on something visible
-    for i, (key, cfg) in enumerate(CALL_TEMPLATES.items()):
-        with st.expander(cfg["label"], expanded=(i == 0)):
-            st.markdown(cfg["template"])
+        # Default-open the first one so the page lands on something visible
+        for i, (key, cfg) in enumerate(CALL_TEMPLATES.items()):
+            with st.expander(cfg["label"], expanded=(i == 0)):
+                st.markdown(cfg["template"])
 
 
 # -----------------------------
