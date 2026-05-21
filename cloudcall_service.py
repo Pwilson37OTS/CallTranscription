@@ -267,23 +267,43 @@ def import_recording_to_pipeline(
             recording["cloudcall_recording_id"],
         )
 
-        # Convert to WAV
-        wav_path = convert_file_to_wav(download_path, CLOUDCALL_DOWNLOAD_DIR)
+        # CloudCall recordings arrive in OpenAI-compatible formats (mp3/mp4/
+        # wav/ogg/m4a). Skip the ffmpeg conversion to WAV — that step ~5x'd
+        # the on-disk size of every call without adding any value for either
+        # transcription or playback. Move the original into CONVERTED_DIR
+        # (the "official" audio location) and use it as-is.
+        import shutil
+        final_path = CONVERTED_DIR / download_path.name
+        if final_path.exists():
+            final_path.unlink()  # in case of retry collisions
+        shutil.move(str(download_path), str(final_path))
+        download_path = None  # don't double-delete in finally
 
-        # Build the original filename for display
+        # Pick a mime type from the extension
+        ext = final_path.suffix.lower()
+        mime_map = {
+            ".mp3":  "audio/mpeg",
+            ".mp4":  "audio/mp4",
+            ".m4a":  "audio/mp4",
+            ".wav":  "audio/wav",
+            ".ogg":  "audio/ogg",
+            ".webm": "audio/webm",
+            ".flac": "audio/flac",
+        }
+        mime_type = mime_map.get(ext, "audio/mpeg")
+
         call_id_short = recording["cloudcall_recording_id"][:20]
-        original_filename = f"cloudcall_{call_id_short}{download_path.suffix}"
+        original_filename = f"cloudcall_{call_id_short}{final_path.suffix}"
 
-        # Store relative path from project root
-        relative_path = wav_path.relative_to(Path(__file__).parent)
+        relative_path = final_path.relative_to(Path(__file__).parent)
 
         # Insert into calls table
         call_record = {
             "created_at": datetime.utcnow().isoformat(),
             "original_filename": original_filename,
-            "stored_filename": wav_path.name,
+            "stored_filename": final_path.name,
             "stored_path": str(relative_path),
-            "mime_type": "audio/wav",
+            "mime_type": mime_type,
             "recruiter_name": metadata.get("recruiter_name", ""),
             "subject_name": metadata.get("subject_name", ""),
             "company_name": metadata.get("company_name", ""),
