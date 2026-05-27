@@ -271,7 +271,14 @@ with calls_tab:
             return f"{recruiter} | {contact} | {dt_str}"
 
         options = {_call_label(row): row["id"] for row in calls}
-        selected_label = st.selectbox("Select a call", list(options.keys()))
+        # Explicit session-level key so the selection survives reruns triggered
+        # by transcription, analysis, or background poller imports. Without
+        # this, the dropdown can silently reset to the first call mid-action.
+        selected_label = st.selectbox(
+            "Select a call",
+            list(options.keys()),
+            key="active_call_selection",
+        )
         selected_id = options[selected_label]
         call = get_call(selected_id, user_id=query_user_id)
 
@@ -282,11 +289,18 @@ with calls_tab:
             # known) so the call-type default reflects the current call.
             # -------------------------
             coach_options = list(CALL_TEMPLATES.keys())
-            default_idx = (
-                coach_options.index(call["call_type"])
-                if call["call_type"] in coach_options
-                else 0
-            )
+            # Session-level call type: the user's choice persists across call
+            # changes and across reruns. The per-call key approach was losing
+            # the user's selection every time analyze_call or the poller
+            # triggered a rerun. On first render we seed it from the currently
+            # selected call's stored type; after that, session_state drives.
+            if "active_call_type" not in st.session_state:
+                st.session_state["active_call_type"] = (
+                    call["call_type"]
+                    if call["call_type"] in coach_options
+                    else coach_options[0]
+                )
+
             with coaching_container:
                 st.markdown("### Call Coaching")
 
@@ -296,8 +310,7 @@ with calls_tab:
                         "Call Type",
                         options=coach_options,
                         format_func=lambda k: CALL_TEMPLATES[k]["label"],
-                        index=default_idx,
-                        key=f"coach_type_{call['id']}",
+                        key="active_call_type",
                     )
 
                 is_standard_call = selected_call_type == "standard_call"
