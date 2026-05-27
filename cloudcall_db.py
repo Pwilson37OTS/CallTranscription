@@ -98,14 +98,30 @@ def get_cloudcall_user_mapping(cloudcall_user_id: str) -> Optional[sqlite3.Row]:
         conn.close()
 
 
-def get_all_cloudcall_user_mappings() -> List[sqlite3.Row]:
+def get_all_cloudcall_user_mappings(user_ids=None) -> List[sqlite3.Row]:
+    """Return user mappings. user_ids=None -> all. user_ids=[...] -> only those app users."""
+    if isinstance(user_ids, int):
+        user_ids = [user_ids]
+
     conn = get_conn()
     try:
+        if user_ids is None:
+            return conn.execute(
+                "SELECT m.*, u.display_name as app_user_name, u.email as app_user_email "
+                "FROM cloudcall_user_mapping m "
+                "JOIN users u ON m.app_user_id = u.id "
+                "ORDER BY m.id"
+            ).fetchall()
+        if not user_ids:
+            return []
+        placeholders = ",".join("?" for _ in user_ids)
         return conn.execute(
-            "SELECT m.*, u.display_name as app_user_name, u.email as app_user_email "
-            "FROM cloudcall_user_mapping m "
-            "JOIN users u ON m.app_user_id = u.id "
-            "ORDER BY m.id"
+            f"SELECT m.*, u.display_name as app_user_name, u.email as app_user_email "
+            f"FROM cloudcall_user_mapping m "
+            f"JOIN users u ON m.app_user_id = u.id "
+            f"WHERE m.app_user_id IN ({placeholders}) "
+            f"ORDER BY m.id",
+            tuple(user_ids),
         ).fetchall()
     finally:
         conn.close()
@@ -188,24 +204,42 @@ def insert_cloudcall_recording(record: Dict[str, Any]) -> int:
 
 
 def get_cloudcall_recordings(
-    user_id: Optional[int] = None, hours: int = 48
+    user_ids=None, hours: int = 48, user_id=None
 ) -> List[sqlite3.Row]:
-    """Get recordings from the last N hours. If user_id is set, filter by that user."""
+    """Get recordings from the last N hours.
+
+    user_ids semantics:
+      - None      -> no filter (admin / system)
+      - int       -> single-user filter (legacy callers / recruiter scope)
+      - list[int] -> multi-user filter (manager scope = team members)
+      - []        -> match nothing (manager whose team has no members)
+
+    The legacy `user_id` (single int) keyword is also accepted for backward
+    compatibility with older callers and tests.
+    """
+    if user_ids is None and user_id is not None:
+        user_ids = user_id
+    if isinstance(user_ids, int):
+        user_ids = [user_ids]
+
     conn = get_conn()
     cutoff = (datetime.utcnow() - timedelta(hours=hours)).isoformat()
     try:
-        if user_id is not None:
+        if user_ids is None:
             return conn.execute(
                 "SELECT * FROM cloudcall_recordings "
-                "WHERE app_user_id = ? AND webhook_received_at >= ? "
+                "WHERE webhook_received_at >= ? "
                 "ORDER BY call_timestamp DESC",
-                (user_id, cutoff),
+                (cutoff,),
             ).fetchall()
+        if not user_ids:
+            return []
+        placeholders = ",".join("?" for _ in user_ids)
         return conn.execute(
-            "SELECT * FROM cloudcall_recordings "
-            "WHERE webhook_received_at >= ? "
+            f"SELECT * FROM cloudcall_recordings "
+            f"WHERE app_user_id IN ({placeholders}) AND webhook_received_at >= ? "
             "ORDER BY call_timestamp DESC",
-            (cutoff,),
+            (*user_ids, cutoff),
         ).fetchall()
     finally:
         conn.close()

@@ -14,12 +14,19 @@ def verify_password(password: str, password_hash: str) -> bool:
     return bcrypt.checkpw(password.encode("utf-8"), password_hash.encode("utf-8"))
 
 
-def create_user(email: str, display_name: str, password: str, role: str = "recruiter") -> int:
+def create_user(
+    email: str,
+    display_name: str,
+    password: str,
+    role: str = "recruiter",
+    team: Optional[str] = None,
+) -> int:
     record = {
         "email": email.lower().strip(),
         "display_name": display_name.strip(),
         "password_hash": hash_password(password),
         "role": role,
+        "team": (team or None) if (team is None or team.strip()) else None,
     }
     return insert_user(record)
 
@@ -41,10 +48,18 @@ def login(user: Dict[str, Any]) -> None:
     st.session_state["user_email"] = user["email"]
     st.session_state["user_name"] = user["display_name"]
     st.session_state["user_role"] = user["role"]
+    # team is set for recruiters and managers. Managers manage the team
+    # they're a member of. Admins typically have team = None.
+    try:
+        st.session_state["user_team"] = user["team"]
+    except (KeyError, IndexError, TypeError):
+        st.session_state["user_team"] = None
 
 
 def logout() -> None:
-    for key in ["authenticated", "user_id", "user_email", "user_name", "user_role"]:
+    for key in [
+        "authenticated", "user_id", "user_email", "user_name", "user_role", "user_team",
+    ]:
         st.session_state.pop(key, None)
 
 
@@ -56,11 +71,21 @@ def get_current_user() -> Optional[Dict[str, Any]]:
         "email": st.session_state["user_email"],
         "display_name": st.session_state["user_name"],
         "role": st.session_state["user_role"],
+        "team": st.session_state.get("user_team"),
     }
 
 
 def is_admin() -> bool:
     return st.session_state.get("user_role") == "admin"
+
+
+def is_manager() -> bool:
+    return st.session_state.get("user_role") == "manager"
+
+
+def get_user_team() -> Optional[str]:
+    """The team the current user belongs to (and manages, if they're a manager)."""
+    return st.session_state.get("user_team")
 
 
 def require_auth() -> Dict[str, Any]:

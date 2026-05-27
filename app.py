@@ -10,13 +10,14 @@ from styles import APP_CSS
 from db import (
     init_db, insert_call, update_call, get_all_calls, get_call,
     insert_api_usage, get_all_users, get_usage_summary, update_user,
+    get_team_member_ids,
 )
 from openai_service import transcribe_audio, diarize_transcript, analyze_call
 from call_templates import CALL_TEMPLATES
 from file_service import save_uploaded_file, ffmpeg_available
 from auth import (
-    authenticate, login, logout, get_current_user, is_admin,
-    ensure_admin_exists, create_user,
+    authenticate, login, logout, get_current_user, is_admin, is_manager,
+    get_user_team, ensure_admin_exists, create_user,
 )
 from logging_config import logger
 from storage import storage
@@ -109,8 +110,30 @@ if not st.session_state.get("authenticated"):
 
 current_user = get_current_user()
 current_user_id = current_user["id"]
+current_user_team = current_user.get("team")
 user_is_admin = is_admin()
-query_user_id = None if user_is_admin else current_user_id
+user_is_manager = is_manager()
+
+
+def _scoped_user_ids():
+    """Return the user-id scope for the current viewer.
+
+    - Admin: None (see everything).
+    - Manager: list of active user IDs in their team (their own ID included).
+    - Recruiter: [current_user_id].
+    Empty list when a manager has no team set or no team members yet.
+    """
+    if user_is_admin:
+        return None
+    if user_is_manager:
+        if not current_user_team:
+            return []
+        return get_team_member_ids(current_user_team)
+    return [current_user_id]
+
+
+# Cache once per render — get_team_member_ids hits the DB.
+scoped_user_ids = _scoped_user_ids()
 
 
 # -----------------------------
@@ -219,12 +242,21 @@ def ensure_transcript(call) -> str:
 tab_names = ["Calls", "Call Log"]
 if user_is_admin:
     tab_names.extend(["Templates", "Admin"])
+elif user_is_manager:
+    tab_names.append("Team")
 
 tabs = st.tabs(tab_names)
 calls_tab = tabs[0]
 log_tab = tabs[1]
 templates_tab = tabs[2] if user_is_admin else None
-admin_tab = tabs[3] if user_is_admin else None
+# admin_tab also serves as the Manager's "Team" tab — same code, scoped
+# by role inside the body.
+if user_is_admin:
+    admin_tab = tabs[3]
+elif user_is_manager:
+    admin_tab = tabs[2]
+else:
+    admin_tab = None
 
 
 # -----------------------------
@@ -238,7 +270,7 @@ with calls_tab:
     # but it displays here, above the call selector.
     coaching_container = st.container()
 
-    calls = get_all_calls(user_id=query_user_id)
+    calls = get_all_calls(user_ids=scoped_user_ids)
 
     if not calls:
         if CLOUDCALL_ENABLED:
@@ -280,7 +312,7 @@ with calls_tab:
             key="active_call_selection",
         )
         selected_id = options[selected_label]
-        call = get_call(selected_id, user_id=query_user_id)
+        call = get_call(selected_id, user_ids=scoped_user_ids)
 
         if call:
             # -------------------------
@@ -523,11 +555,14 @@ with log_tab:
     else:
         st.subheader("Call Log")
 
-    st.caption(
-        "CloudCall recordings from the last 72 hours. "
-        + ("Admin view — showing calls across all users." if user_is_admin
-           else "Showing only calls associated with your CloudCall account.")
-    )
+    if user_is_admin:
+        log_scope_note = "Admin view — showing calls across all users."
+    elif user_is_manager:
+        team_label = current_user_team or "your team"
+        log_scope_note = f"Manager view — showing calls for **{team_label}** members."
+    else:
+        log_scope_note = "Showing only calls associated with your CloudCall account."
+    st.caption("CloudCall recordings from the last 72 hours. " + log_scope_note)
 
     if not CLOUDCALL_ENABLED:
         st.info("CloudCall integration is not enabled.")
@@ -539,11 +574,11 @@ with log_tab:
         _CT = _ZoneInfo("America/Chicago")
         _UTC = _ZoneInfo("UTC")
 
-        # Admins see every recording; non-admins are filtered by app_user_id
-        # (set when the poller matches a CloudCall user mapping). Recordings
-        # without a mapping are invisible to non-admins by design.
-        log_scope_user_id = None if user_is_admin else current_user_id
-        recordings = _get_cc_recs(user_id=log_scope_user_id, hours=72)
+        # Admins see every recording; managers see their team's; recruiters
+        # see only their own. Filtering is by app_user_id set when the poller
+        # matched a CloudCall user mapping. Recordings without a mapping are
+        # invisible to non-admins by design.
+        recordings = _get_cc_recs(user_ids=scoped_user_ids, hours=72)
 
         if not recordings:
             st.info("No CloudCall recordings in the last 72 hours.")
@@ -689,27 +724,50 @@ if templates_tab is not None:
 # -----------------------------
 if admin_tab is not None:
     with admin_tab:
-        st.subheader("Administration")
+        if user_is_admin:
+            st.subheader("Administration")
+        else:
+            team_label = current_user_team or "(no team assigned)"
+            st.subheader(f"Team Management — {team_label}")
+            if not current_user_team:
+                st.warning(
+                    "You're flagged as a manager but no team is assigned to your "
+                    "account yet. Ask an admin to set your team — until then, you "
+                    "won't see any users or calls in this tab."
+                )
 
         # --- User Management ---
         st.markdown("### User Management")
-        users = get_all_users()
+
+        all_users = get_all_users()
+        # Managers see only users on their team; admins see everyone.
+        if user_is_admin:
+            users = all_users
+        else:
+            users = [u for u in all_users if u["team"] and u["team"] == current_user_team]
+
         if users:
             from auth import hash_password as _hash_password
             for u in users:
-                col_name, col_email, col_role, col_status, col_action = st.columns([2, 3, 1, 1, 3])
+                col_name, col_email, col_role, col_team, col_status, col_action = st.columns(
+                    [2, 2.5, 1, 1.2, 1, 3]
+                )
                 with col_name:
                     st.write(u["display_name"])
                 with col_email:
                     st.write(u["email"])
                 with col_role:
                     st.write(u["role"])
+                with col_team:
+                    st.write(u["team"] or "—")
                 with col_status:
                     st.write("Active" if u["is_active"] else "Inactive")
                 with col_action:
                     if u["id"] != current_user_id:
-                        action_a, action_b = st.columns(2)
-                        with action_a:
+                        # Admins get a third Edit button for role/team; managers don't.
+                        action_count = 3 if user_is_admin else 2
+                        action_cols = st.columns(action_count)
+                        with action_cols[0]:
                             if u["is_active"]:
                                 if st.button("Deactivate", key=f"deact_{u['id']}", use_container_width=True):
                                     update_user(u["id"], is_active=0)
@@ -718,12 +776,18 @@ if admin_tab is not None:
                                 if st.button("Activate", key=f"act_{u['id']}", use_container_width=True):
                                     update_user(u["id"], is_active=1)
                                     st.rerun()
-                        with action_b:
+                        with action_cols[1]:
                             if st.button("Change Password", key=f"changepw_btn_{u['id']}", use_container_width=True):
-                                # Toggle the inline form for this user
                                 key = f"_pw_edit_{u['id']}"
                                 st.session_state[key] = not st.session_state.get(key, False)
                                 st.rerun()
+                        if user_is_admin:
+                            with action_cols[2]:
+                                if st.button("Edit", key=f"edit_btn_{u['id']}", use_container_width=True,
+                                             help="Change role and team (admin only)."):
+                                    key = f"_role_edit_{u['id']}"
+                                    st.session_state[key] = not st.session_state.get(key, False)
+                                    st.rerun()
 
                 # Inline password reset form, shown only when toggled for this user
                 if u["id"] != current_user_id and st.session_state.get(f"_pw_edit_{u['id']}", False):
@@ -761,22 +825,93 @@ if admin_tab is not None:
                             st.session_state[f"_pw_edit_{u['id']}"] = False
                             st.rerun()
 
+                # Inline role/team edit form — admin only
+                if (
+                    user_is_admin
+                    and u["id"] != current_user_id
+                    and st.session_state.get(f"_role_edit_{u['id']}", False)
+                ):
+                    with st.form(f"role_form_{u['id']}"):
+                        st.markdown(f"**Change role / team for {u['email']}**")
+                        role_options = ["recruiter", "manager", "admin"]
+                        current_role = u["role"] if u["role"] in role_options else "recruiter"
+                        new_role_val = st.selectbox(
+                            "Role",
+                            options=role_options,
+                            index=role_options.index(current_role),
+                            key=f"role_input_{u['id']}",
+                        )
+                        new_team_val = st.text_input(
+                            "Team (leave blank for unassigned)",
+                            value=u["team"] or "",
+                            key=f"team_input_{u['id']}",
+                            help="Example: 'Team 1'. Recruiters and managers should belong to a team; admins typically don't.",
+                        )
+                        edit_btn_cols = st.columns([1, 1, 4])
+                        with edit_btn_cols[0]:
+                            save_role = st.form_submit_button("Save", use_container_width=True)
+                        with edit_btn_cols[1]:
+                            cancel_role = st.form_submit_button("Cancel", use_container_width=True)
+
+                        if save_role:
+                            try:
+                                update_user(
+                                    u["id"],
+                                    role=new_role_val,
+                                    team=(new_team_val.strip() or None),
+                                )
+                                logger.info(
+                                    "Admin role/team edit: target_user_id=%d role=%s team=%s by user_id=%d",
+                                    u["id"], new_role_val, new_team_val, current_user_id,
+                                )
+                                st.success(f"Updated {u['email']}.")
+                                st.session_state[f"_role_edit_{u['id']}"] = False
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Update failed: {e}")
+                        elif cancel_role:
+                            st.session_state[f"_role_edit_{u['id']}"] = False
+                            st.rerun()
+
         st.markdown("---")
         st.markdown("### Create New User")
+        # Manager can create only recruiters on their own team; admin has
+        # full control of role and team.
         with st.form("create_user_form"):
             new_email = st.text_input("Email")
             new_name = st.text_input("Display Name")
             new_password = st.text_input("Password", type="password")
-            new_role = st.selectbox("Role", options=["recruiter", "admin"])
+
+            if user_is_admin:
+                new_role = st.selectbox("Role", options=["recruiter", "manager", "admin"])
+                new_team_input = st.text_input(
+                    "Team (leave blank for unassigned)",
+                    help="Example: 'Team 1'. Recruiters and managers should belong to a team.",
+                )
+                effective_team = new_team_input.strip() or None
+            else:
+                # Manager: role locked to recruiter, team locked to manager's team.
+                st.caption(
+                    f"As a manager you can create recruiter accounts on **{current_user_team}**. "
+                    "Admins create managers and admins, and reassign teams."
+                )
+                new_role = "recruiter"
+                effective_team = current_user_team
+
             create_submitted = st.form_submit_button("Create User")
             if create_submitted:
                 if not new_email or not new_name or not new_password:
                     st.error("All fields are required.")
                 elif len(new_password) < 6:
                     st.error("Password must be at least 6 characters.")
+                elif not user_is_admin and not current_user_team:
+                    st.error("You don't have a team assigned. Ask an admin to set one before creating users.")
                 else:
                     try:
-                        create_user(new_email, new_name, new_password, new_role)
+                        create_user(
+                            new_email, new_name, new_password,
+                            role=new_role, team=effective_team,
+                        )
                         st.success(f"User {new_email} created.")
                         st.rerun()
                     except Exception as e:
@@ -785,55 +920,59 @@ if admin_tab is not None:
                         else:
                             st.error(f"Failed to create user: {e}")
 
-        # --- Storage Usage ---
-        st.markdown("---")
-        st.markdown("### Storage Usage")
-        st.caption(
-            f"Files older than the retention window "
-            f"({int(os.getenv('CLOUDCALL_RECORDING_RETENTION_HOURS', '72'))} hours) "
-            "are auto-pruned every 15 minutes via the background poller and on each "
-            "container restart. Use Force Cleanup Now to run immediately."
-        )
-        try:
-            from cloudcall_service import get_storage_breakdown
-            breakdown = get_storage_breakdown()
-            import pandas as _pd
-            sdf = _pd.DataFrame(breakdown)
-            sdf["Size"] = sdf["size_bytes"].map(lambda b: f"{b / (1024 * 1024):.1f} MB")
-            sdf["Files"] = sdf["files"]
-            sdf["Path"] = sdf["path"]
-            st.dataframe(sdf[["Path", "Files", "Size"]], use_container_width=True, hide_index=True)
-            total_mb = sum(b["size_bytes"] for b in breakdown) / (1024 * 1024)
-            st.caption(f"**Total app data: {total_mb:.1f} MB**")
-        except Exception as e:
-            st.error(f"Could not read storage breakdown: {e}")
-
-        if st.button("Force Cleanup Now", key="force_cleanup_btn", help="Run cleanup immediately, bypassing the 15-minute throttle."):
+        # --- Storage Usage / Force Cleanup (Admin only — system-wide) ---
+        if user_is_admin:
+            st.markdown("---")
+            st.markdown("### Storage Usage")
+            st.caption(
+                f"Files older than the retention window "
+                f"({int(os.getenv('CLOUDCALL_RECORDING_RETENTION_HOURS', '72'))} hours) "
+                "are auto-pruned every 15 minutes via the background poller and on each "
+                "container restart. Use Force Cleanup Now to run immediately."
+            )
             try:
-                from cloudcall_service import maybe_cleanup_expired
-                with st.spinner("Running cleanup..."):
-                    result = maybe_cleanup_expired(force=True)
-                files = result.get("files_removed", 0)
-                rows = result.get("db_rows_deleted", 0)
-                if "error" in result:
-                    st.error(f"Cleanup ran with errors: {result['error']}")
-                else:
-                    st.success(
-                        f"Cleanup complete — removed {files} file(s) and {rows} expired CloudCall recording row(s)."
-                    )
-                logger.info(
-                    "Admin force cleanup: user_id=%d files=%d rows=%d",
-                    current_user_id, files, rows,
-                )
-                st.rerun()
+                from cloudcall_service import get_storage_breakdown
+                breakdown = get_storage_breakdown()
+                import pandas as _pd
+                sdf = _pd.DataFrame(breakdown)
+                sdf["Size"] = sdf["size_bytes"].map(lambda b: f"{b / (1024 * 1024):.1f} MB")
+                sdf["Files"] = sdf["files"]
+                sdf["Path"] = sdf["path"]
+                st.dataframe(sdf[["Path", "Files", "Size"]], use_container_width=True, hide_index=True)
+                total_mb = sum(b["size_bytes"] for b in breakdown) / (1024 * 1024)
+                st.caption(f"**Total app data: {total_mb:.1f} MB**")
             except Exception as e:
-                logger.error("Force cleanup failed: user_id=%d error=%s", current_user_id, e)
-                st.error(f"Cleanup failed: {e}")
+                st.error(f"Could not read storage breakdown: {e}")
 
-        # --- API Usage ---
+            if st.button("Force Cleanup Now", key="force_cleanup_btn", help="Run cleanup immediately, bypassing the 15-minute throttle."):
+                try:
+                    from cloudcall_service import maybe_cleanup_expired
+                    with st.spinner("Running cleanup..."):
+                        result = maybe_cleanup_expired(force=True)
+                    files = result.get("files_removed", 0)
+                    rows = result.get("db_rows_deleted", 0)
+                    if "error" in result:
+                        st.error(f"Cleanup ran with errors: {result['error']}")
+                    else:
+                        st.success(
+                            f"Cleanup complete — removed {files} file(s) and {rows} expired CloudCall recording row(s)."
+                        )
+                    logger.info(
+                        "Admin force cleanup: user_id=%d files=%d rows=%d",
+                        current_user_id, files, rows,
+                    )
+                    st.rerun()
+                except Exception as e:
+                    logger.error("Force cleanup failed: user_id=%d error=%s", current_user_id, e)
+                    st.error(f"Cleanup failed: {e}")
+
+        # --- API Usage (scoped by role) ---
         st.markdown("---")
-        st.markdown("### API Usage (Last 30 Days)")
-        usage_summary = get_usage_summary(days=30)
+        api_usage_header = "### API Usage (Last 30 Days)"
+        if not user_is_admin:
+            api_usage_header += f" — {current_user_team or 'Team'}"
+        st.markdown(api_usage_header)
+        usage_summary = get_usage_summary(days=30, user_ids=scoped_user_ids)
         if usage_summary:
             import pandas as pd
             df = pd.DataFrame([dict(row) for row in usage_summary])
@@ -851,8 +990,8 @@ if admin_tab is not None:
         else:
             st.info("No API usage recorded yet.")
 
-        # --- CloudCall Ingest Stats ---
-        if CLOUDCALL_ENABLED:
+        # --- CloudCall Ingest Stats (Admin only — system-wide) ---
+        if CLOUDCALL_ENABLED and user_is_admin:
             from cloudcall_service import get_cloudcall_ingest_stats, reimport_unmapped_recordings
 
             st.markdown("---")
@@ -919,7 +1058,8 @@ if admin_tab is not None:
             st.markdown("### CloudCall User Mappings")
             st.caption("Map CloudCall user IDs / extensions to app users so recordings auto-import to the right recruiter.")
 
-            mappings = get_all_cloudcall_user_mappings()
+            # Manager sees only mappings for users on their team. Admin sees all.
+            mappings = get_all_cloudcall_user_mappings(user_ids=scoped_user_ids)
             if mappings:
                 for m in mappings:
                     mc1, mc2, mc3, mc4 = st.columns([2, 2, 3, 1])
@@ -934,26 +1074,41 @@ if admin_tab is not None:
                             delete_cloudcall_user_mapping(m["id"])
                             st.rerun()
             else:
-                st.info("No CloudCall user mappings configured yet.")
+                st.info("No CloudCall user mappings to show.")
 
-            unmapped_ids = get_unmapped_cloudcall_user_ids()
-            if unmapped_ids:
-                st.warning(
-                    f"**{len(unmapped_ids)} unmapped CloudCall user ID(s)** have recordings without a linked app user: "
-                    f"{', '.join(unmapped_ids)}"
-                )
+            # Unmapped-recordings warning is system-wide, only useful to admin.
+            if user_is_admin:
+                unmapped_ids = get_unmapped_cloudcall_user_ids()
+                if unmapped_ids:
+                    st.warning(
+                        f"**{len(unmapped_ids)} unmapped CloudCall user ID(s)** have recordings without a linked app user: "
+                        f"{', '.join(unmapped_ids)}"
+                    )
 
             st.markdown("#### Add New Mapping")
             with st.form("add_cc_mapping"):
+                # Admin can map to any app user; manager can only map to their team.
                 all_users_for_map = get_all_users()
+                if user_is_admin:
+                    map_candidates = all_users_for_map
+                else:
+                    map_candidates = [
+                        u for u in all_users_for_map
+                        if u["team"] and u["team"] == current_user_team
+                    ]
                 cc_user_id = st.text_input("CloudCall User ID / Extension")
                 cc_display_name = st.text_input("CloudCall Display Name (optional)")
-                app_user_options = {f"{u['display_name']} ({u['email']})": u["id"] for u in all_users_for_map}
+                app_user_options = {f"{u['display_name']} ({u['email']})": u["id"] for u in map_candidates}
+                if not app_user_options:
+                    st.caption("_No app users available for mapping. Create users above first._")
                 selected_app_user_label = st.selectbox(
                     "App User",
-                    options=list(app_user_options.keys()),
+                    options=list(app_user_options.keys()) if app_user_options else ["(no eligible users)"],
+                    disabled=not app_user_options,
                 )
-                mapping_submitted = st.form_submit_button("Save Mapping")
+                mapping_submitted = st.form_submit_button(
+                    "Save Mapping", disabled=not app_user_options
+                )
                 if mapping_submitted:
                     if not cc_user_id:
                         st.error("CloudCall User ID is required.")
@@ -967,57 +1122,58 @@ if admin_tab is not None:
                         st.success(f"Mapping saved: {cc_user_id} -> {selected_app_user_label}")
                         st.rerun()
 
-        # --- Manual Upload (admin backup) ---
-        st.markdown("---")
-        st.markdown("### Manual Upload (Backup)")
-        st.caption("Backup ingest path for cases when CloudCall didn't capture a call. Files upload into the currently signed-in admin's call list.")
+        # --- Manual Upload (Admin only — system-wide backup tool) ---
+        if user_is_admin:
+            st.markdown("---")
+            st.markdown("### Manual Upload (Backup)")
+            st.caption("Backup ingest path for cases when CloudCall didn't capture a call. Files upload into the currently signed-in admin's call list.")
 
-        with st.form("manual_upload_form"):
-            uploaded_file = st.file_uploader(
-                "Audio file",
-                type=None,
-                help="Any audio format accepted — ffmpeg converts to WAV automatically.",
-            )
-            up_col1, up_col2 = st.columns(2)
-            with up_col1:
-                up_recruiter = st.text_input("Recruiter Name", value=current_user["display_name"])
-                up_subject = st.text_input("Contact Name")
-            with up_col2:
-                up_company = st.text_input("Company / Client")
-                up_notes = st.text_area("Notes", placeholder="Optional context.")
-            up_submitted = st.form_submit_button("Save Recording")
-            if up_submitted:
-                if not uploaded_file:
-                    st.error("Please choose an audio file.")
-                else:
-                    try:
-                        file_info = save_uploaded_file(uploaded_file)
-                        record = {
-                            "created_at": datetime.utcnow().isoformat(),
-                            **file_info,
-                            "recruiter_name": up_recruiter,
-                            "subject_name": up_subject,
-                            "company_name": up_company,
-                            "notes": up_notes,
-                            "call_type": "standard_call",
-                            "status": "uploaded",
-                            "transcript_text": None,
-                            "summary_text": None,
-                            "transcription_model": None,
-                            "summary_model": None,
-                            "user_id": current_user_id,
-                        }
-                        new_id = insert_call(record)
-                        logger.info(
-                            "Manual upload: user_id=%d call_id=%d file=%s",
-                            current_user_id, new_id, file_info.get("original_filename", ""),
-                        )
-                        st.success(f"Recording saved. Call ID: {new_id}")
-                    except Exception as e:
-                        logger.error("Manual upload failed: user_id=%d error=%s", current_user_id, e)
-                        st.error(f"Upload failed: {e}")
-                        if not ffmpeg_available():
-                            st.info("Install ffmpeg, then restart Streamlit. Windows: `winget install Gyan.FFmpeg`")
+            with st.form("manual_upload_form"):
+                uploaded_file = st.file_uploader(
+                    "Audio file",
+                    type=None,
+                    help="Any audio format accepted — ffmpeg converts to WAV automatically.",
+                )
+                up_col1, up_col2 = st.columns(2)
+                with up_col1:
+                    up_recruiter = st.text_input("Recruiter Name", value=current_user["display_name"])
+                    up_subject = st.text_input("Contact Name")
+                with up_col2:
+                    up_company = st.text_input("Company / Client")
+                    up_notes = st.text_area("Notes", placeholder="Optional context.")
+                up_submitted = st.form_submit_button("Save Recording")
+                if up_submitted:
+                    if not uploaded_file:
+                        st.error("Please choose an audio file.")
+                    else:
+                        try:
+                            file_info = save_uploaded_file(uploaded_file)
+                            record = {
+                                "created_at": datetime.utcnow().isoformat(),
+                                **file_info,
+                                "recruiter_name": up_recruiter,
+                                "subject_name": up_subject,
+                                "company_name": up_company,
+                                "notes": up_notes,
+                                "call_type": "standard_call",
+                                "status": "uploaded",
+                                "transcript_text": None,
+                                "summary_text": None,
+                                "transcription_model": None,
+                                "summary_model": None,
+                                "user_id": current_user_id,
+                            }
+                            new_id = insert_call(record)
+                            logger.info(
+                                "Manual upload: user_id=%d call_id=%d file=%s",
+                                current_user_id, new_id, file_info.get("original_filename", ""),
+                            )
+                            st.success(f"Recording saved. Call ID: {new_id}")
+                        except Exception as e:
+                            logger.error("Manual upload failed: user_id=%d error=%s", current_user_id, e)
+                            st.error(f"Upload failed: {e}")
+                            if not ffmpeg_available():
+                                st.info("Install ffmpeg, then restart Streamlit. Windows: `winget install Gyan.FFmpeg`")
 
         # The full per-row CloudCall inbox now lives on the Call Log tab
         # (admins see all calls there). The high-level ingest counts above

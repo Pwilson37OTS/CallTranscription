@@ -31,10 +31,17 @@ def init_db() -> None:
                 password_hash TEXT NOT NULL,
                 role TEXT DEFAULT 'recruiter',
                 is_active INTEGER DEFAULT 1,
-                created_at TEXT NOT NULL
+                created_at TEXT NOT NULL,
+                team TEXT
             )
             """
         )
+        # Idempotent migration for installs created before team existed.
+        # Managers are scoped to a team — their team is what they manage.
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN team TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS calls (
@@ -92,8 +99,8 @@ def insert_user(record: Dict[str, Any]) -> int:
     try:
         cursor = conn.execute(
             """
-            INSERT INTO users (email, display_name, password_hash, role, is_active, created_at)
-            VALUES (?, ?, ?, ?, ?, ?)
+            INSERT INTO users (email, display_name, password_hash, role, is_active, created_at, team)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 record["email"],
@@ -102,10 +109,26 @@ def insert_user(record: Dict[str, Any]) -> int:
                 record.get("role", "recruiter"),
                 record.get("is_active", 1),
                 record.get("created_at", datetime.utcnow().isoformat()),
+                record.get("team"),
             ),
         )
         conn.commit()
         return cursor.lastrowid
+    finally:
+        conn.close()
+
+
+def get_team_member_ids(team: str) -> List[int]:
+    """Return active user IDs belonging to a team (used for manager scoping)."""
+    if not team:
+        return []
+    conn = get_conn()
+    try:
+        rows = conn.execute(
+            "SELECT id FROM users WHERE team = ? AND is_active = 1 ORDER BY id",
+            (team,),
+        ).fetchall()
+        return [r["id"] for r in rows]
     finally:
         conn.close()
 
@@ -135,7 +158,7 @@ def get_all_users() -> List[sqlite3.Row]:
 
 
 def update_user(user_id: int, **fields) -> None:
-    allowed = {"display_name", "role", "is_active", "password_hash"}
+    allowed = {"display_name", "role", "is_active", "password_hash", "team"}
     if not fields:
         return
     invalid = set(fields.keys()) - allowed
@@ -213,26 +236,69 @@ def update_call(call_id: int, **fields) -> None:
         conn.close()
 
 
-def get_all_calls(user_id: Optional[int] = None) -> List[sqlite3.Row]:
+def _user_scope_clause(user_ids):
+    """Build a SQL fragment for filtering by a list of user IDs.
+
+    Returns (sql_fragment, values_tuple). user_ids semantics:
+      - None  -> no filter (admin view): returns ("", ())
+      - []    -> match nothing (manager whose team has no members yet)
+      - list  -> WHERE user_id IN (?, ?, ...)
+    """
+    if user_ids is None:
+        return "", ()
+    if not user_ids:
+        return " AND 1=0", ()
+    placeholders = ",".join("?" for _ in user_ids)
+    return f" AND user_id IN ({placeholders})", tuple(user_ids)
+
+
+def get_all_calls(user_ids=None, user_id=None) -> List[sqlite3.Row]:
+    """Return calls. user_ids=None (admin) -> all calls. user_ids=[...] -> filtered.
+
+    Accepts both the new `user_ids` list and the legacy `user_id` single int
+    for backward compatibility with older tests / callers.
+    """
+    if user_ids is None and user_id is not None:
+        user_ids = user_id
+    if isinstance(user_ids, int):
+        user_ids = [user_ids]
+
     conn = get_conn()
     try:
-        if user_id is not None:
-            return conn.execute(
-                "SELECT * FROM calls WHERE user_id = ? ORDER BY id DESC", (user_id,)
-            ).fetchall()
-        return conn.execute("SELECT * FROM calls ORDER BY id DESC").fetchall()
+        if user_ids is None:
+            return conn.execute("SELECT * FROM calls ORDER BY id DESC").fetchall()
+        if not user_ids:
+            return []
+        placeholders = ",".join("?" for _ in user_ids)
+        return conn.execute(
+            f"SELECT * FROM calls WHERE user_id IN ({placeholders}) ORDER BY id DESC",
+            tuple(user_ids),
+        ).fetchall()
     finally:
         conn.close()
 
 
-def get_call(call_id: int, user_id: Optional[int] = None) -> Optional[sqlite3.Row]:
+def get_call(call_id: int, user_ids=None, user_id=None) -> Optional[sqlite3.Row]:
+    """Return a call by id, optionally filtered to a user-ID scope.
+
+    Accepts the legacy `user_id` (single int) keyword for backward compat.
+    """
+    if user_ids is None and user_id is not None:
+        user_ids = user_id
+    if isinstance(user_ids, int):
+        user_ids = [user_ids]
+
     conn = get_conn()
     try:
-        if user_id is not None:
-            return conn.execute(
-                "SELECT * FROM calls WHERE id = ? AND user_id = ?", (call_id, user_id)
-            ).fetchone()
-        return conn.execute("SELECT * FROM calls WHERE id = ?", (call_id,)).fetchone()
+        if user_ids is None:
+            return conn.execute("SELECT * FROM calls WHERE id = ?", (call_id,)).fetchone()
+        if not user_ids:
+            return None
+        placeholders = ",".join("?" for _ in user_ids)
+        return conn.execute(
+            f"SELECT * FROM calls WHERE id = ? AND user_id IN ({placeholders})",
+            (call_id, *user_ids),
+        ).fetchone()
     finally:
         conn.close()
 
@@ -292,13 +358,37 @@ def get_api_usage(user_id: Optional[int] = None, days: int = 30) -> List[sqlite3
         conn.close()
 
 
-def get_usage_summary(days: int = 30) -> List[sqlite3.Row]:
-    """Get per-user cost summary for the admin dashboard."""
+def get_usage_summary(days: int = 30, user_ids=None) -> List[sqlite3.Row]:
+    """Get per-user cost summary for the admin dashboard, optionally team-scoped."""
+    if isinstance(user_ids, int):
+        user_ids = [user_ids]
+
     conn = get_conn()
     cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
     try:
+        if user_ids is None:
+            return conn.execute(
+                """
+                SELECT
+                    u.display_name,
+                    u.email,
+                    COUNT(au.id) as total_calls,
+                    SUM(CASE WHEN au.operation = 'transcription' THEN 1 ELSE 0 END) as transcriptions,
+                    SUM(CASE WHEN au.operation = 'summarization' THEN 1 ELSE 0 END) as summarizations,
+                    SUM(au.estimated_cost_cents) as total_cost_cents
+                FROM api_usage au
+                JOIN users u ON au.user_id = u.id
+                WHERE au.created_at >= ?
+                GROUP BY au.user_id
+                ORDER BY total_cost_cents DESC
+                """,
+                (cutoff,),
+            ).fetchall()
+        if not user_ids:
+            return []
+        placeholders = ",".join("?" for _ in user_ids)
         return conn.execute(
-            """
+            f"""
             SELECT
                 u.display_name,
                 u.email,
@@ -308,11 +398,11 @@ def get_usage_summary(days: int = 30) -> List[sqlite3.Row]:
                 SUM(au.estimated_cost_cents) as total_cost_cents
             FROM api_usage au
             JOIN users u ON au.user_id = u.id
-            WHERE au.created_at >= ?
+            WHERE au.created_at >= ? AND au.user_id IN ({placeholders})
             GROUP BY au.user_id
             ORDER BY total_cost_cents DESC
             """,
-            (cutoff,),
+            (cutoff, *user_ids),
         ).fetchall()
     finally:
         conn.close()
