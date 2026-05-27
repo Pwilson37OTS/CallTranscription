@@ -15,16 +15,91 @@ def get_openai_client() -> OpenAI:
     return OpenAI(api_key=api_key)
 
 
-def transcribe_audio(file_path: str, model: str = "gpt-4o-transcribe") -> str:
-    logger.info("Transcription started: model=%s file=%s", model, file_path)
+# OpenAI's transcription API caps a single request at 25 MB. We use a slightly
+# lower ceiling for the "do we need to chunk?" check so we don't get caught by
+# off-by-one rounding or content-length overhead.
+_TRANSCRIBE_DIRECT_LIMIT_BYTES = 24 * 1024 * 1024
+
+# How long each chunk should be when we have to split. 10 minutes at 32kbps mono
+# MP3 is ~2.4 MB, well under the limit, and short enough that a stuck request
+# can't waste a huge amount of time.
+_TRANSCRIBE_CHUNK_SECONDS = 600
+
+
+def _transcribe_single_file(file_path: str, model: str) -> str:
+    """Send one audio file to the OpenAI transcription endpoint."""
     client = get_openai_client()
     with open(file_path, "rb") as audio_file:
         transcript = client.audio.transcriptions.create(
             model=model,
             file=audio_file,
         )
-    logger.info("Transcription complete: model=%s chars=%d", model, len(transcript.text))
     return transcript.text
+
+
+def transcribe_audio(file_path: str, model: str = "gpt-4o-transcribe") -> str:
+    """Transcribe an audio file. Auto-chunks for files larger than the API limit.
+
+    For typical CloudCall recordings under ~50 minutes / 24 MB this is a single
+    request. For longer calls we split with ffmpeg into ~10 minute MP3 chunks
+    and concatenate the transcripts. Speaker diarization runs after, on the
+    combined text.
+    """
+    from pathlib import Path
+    path_obj = Path(file_path)
+    size_bytes = path_obj.stat().st_size
+
+    logger.info(
+        "Transcription started: model=%s file=%s size_mb=%.1f",
+        model, file_path, size_bytes / (1024 * 1024),
+    )
+
+    # Small enough → single request, original behavior.
+    if size_bytes <= _TRANSCRIBE_DIRECT_LIMIT_BYTES:
+        text = _transcribe_single_file(file_path, model)
+        logger.info("Transcription complete: model=%s chars=%d", model, len(text))
+        return text
+
+    # Over the per-request limit → chunk and stitch.
+    from file_service import split_audio_for_transcription
+    logger.info(
+        "File exceeds %d MB single-request limit; chunking into %ds segments",
+        _TRANSCRIBE_DIRECT_LIMIT_BYTES // (1024 * 1024),
+        _TRANSCRIBE_CHUNK_SECONDS,
+    )
+
+    chunks = split_audio_for_transcription(
+        path_obj, chunk_seconds=_TRANSCRIBE_CHUNK_SECONDS
+    )
+    chunks_dir = chunks[0].parent
+    try:
+        parts = []
+        for i, chunk_path in enumerate(chunks, start=1):
+            logger.info(
+                "Transcribing chunk %d/%d: %s (%.1f MB)",
+                i, len(chunks), chunk_path.name,
+                chunk_path.stat().st_size / (1024 * 1024),
+            )
+            part_text = _transcribe_single_file(str(chunk_path), model)
+            parts.append(part_text)
+
+        combined = "\n\n".join(parts)
+        logger.info(
+            "Transcription complete (chunked): chunks=%d total_chars=%d",
+            len(chunks), len(combined),
+        )
+        return combined
+    finally:
+        # Always clean up chunk files + their directory, even on partial failure.
+        for chunk_path in chunks:
+            try:
+                chunk_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        try:
+            chunks_dir.rmdir()
+        except OSError:
+            pass
 
 
 def diarize_transcript(

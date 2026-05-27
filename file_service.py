@@ -56,6 +56,65 @@ def convert_audio_to_wav(input_path: Path) -> Path:
     return convert_file_to_wav(input_path, UPLOAD_DIR)
 
 
+def split_audio_for_transcription(
+    input_path: Path,
+    chunk_seconds: int = 600,
+) -> list:
+    """Split an audio file into fixed-duration MP3 chunks for OpenAI transcription.
+
+    OpenAI's transcription endpoints cap at 25 MB per request. For long
+    recordings (typically over ~50 minutes at VoIP bitrates), we split the
+    audio into smaller chunks, transcribe each, and concatenate the text.
+
+    Re-encodes to mono 16kHz 32kbps MP3 — well below the size limit while
+    preserving enough quality for transcription. The original file is not
+    modified.
+
+    Returns a sorted list of chunk Paths (in <input>_chunks/ directory).
+    Caller is responsible for deleting the chunks and the directory.
+    """
+    if not ffmpeg_available():
+        raise RuntimeError("ffmpeg not available for audio chunking")
+
+    output_dir = input_path.parent / f"{input_path.stem}_chunks"
+    output_dir.mkdir(exist_ok=True)
+    output_pattern = output_dir / "chunk_%03d.mp3"
+
+    command = [
+        "ffmpeg", "-y", "-i", str(input_path),
+        "-f", "segment",
+        "-segment_time", str(chunk_seconds),
+        "-c:a", "libmp3lame",
+        "-b:a", "32k",
+        "-ar", "16000",
+        "-ac", "1",
+        str(output_pattern),
+    ]
+
+    result = subprocess.run(command, capture_output=True, text=True, timeout=600)
+    if result.returncode != 0:
+        # Clean up partial output before raising
+        for f in output_dir.glob("chunk_*.mp3"):
+            f.unlink(missing_ok=True)
+        try:
+            output_dir.rmdir()
+        except OSError:
+            pass
+        raise RuntimeError(
+            f"ffmpeg chunking failed: {result.stderr[-500:] if result.stderr else 'unknown error'}"
+        )
+
+    chunks = sorted(output_dir.glob("chunk_*.mp3"))
+    if not chunks:
+        try:
+            output_dir.rmdir()
+        except OSError:
+            pass
+        raise RuntimeError("ffmpeg produced no chunks")
+
+    return chunks
+
+
 def save_uploaded_file(uploaded_file) -> Dict[str, Any]:
     original_name = uploaded_file.name
     ext = Path(original_name).suffix.lower()
