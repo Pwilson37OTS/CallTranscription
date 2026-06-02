@@ -252,8 +252,27 @@ def _user_scope_clause(user_ids):
     return f" AND user_id IN ({placeholders})", tuple(user_ids)
 
 
+# LEFT JOIN that adds the CloudCall recording duration to each call row.
+# Defensive aggregation (MAX) in case a call ever ends up linked from
+# multiple recording rows; for normal imports it's 1:1. Manual uploads have
+# no recording row, so call_duration_seconds is NULL for those.
+_CALLS_WITH_DURATION_SQL = """
+    SELECT c.*, cr.call_duration_seconds AS call_duration_seconds
+    FROM calls c
+    LEFT JOIN (
+        SELECT imported_call_id, MAX(call_duration_seconds) AS call_duration_seconds
+        FROM cloudcall_recordings
+        WHERE imported_call_id IS NOT NULL
+        GROUP BY imported_call_id
+    ) cr ON cr.imported_call_id = c.id
+"""
+
+
 def get_all_calls(user_ids=None, user_id=None) -> List[sqlite3.Row]:
     """Return calls. user_ids=None (admin) -> all calls. user_ids=[...] -> filtered.
+
+    Each returned row carries the linked CloudCall recording's
+    `call_duration_seconds` (or NULL for manually-uploaded calls).
 
     Accepts both the new `user_ids` list and the legacy `user_id` single int
     for backward compatibility with older tests / callers.
@@ -266,12 +285,15 @@ def get_all_calls(user_ids=None, user_id=None) -> List[sqlite3.Row]:
     conn = get_conn()
     try:
         if user_ids is None:
-            return conn.execute("SELECT * FROM calls ORDER BY id DESC").fetchall()
+            return conn.execute(
+                _CALLS_WITH_DURATION_SQL + " ORDER BY c.id DESC"
+            ).fetchall()
         if not user_ids:
             return []
         placeholders = ",".join("?" for _ in user_ids)
         return conn.execute(
-            f"SELECT * FROM calls WHERE user_id IN ({placeholders}) ORDER BY id DESC",
+            _CALLS_WITH_DURATION_SQL
+            + f" WHERE c.user_id IN ({placeholders}) ORDER BY c.id DESC",
             tuple(user_ids),
         ).fetchall()
     finally:
@@ -281,7 +303,9 @@ def get_all_calls(user_ids=None, user_id=None) -> List[sqlite3.Row]:
 def get_call(call_id: int, user_ids=None, user_id=None) -> Optional[sqlite3.Row]:
     """Return a call by id, optionally filtered to a user-ID scope.
 
-    Accepts the legacy `user_id` (single int) keyword for backward compat.
+    The returned row carries `call_duration_seconds` from the linked
+    CloudCall recording (NULL for manual uploads). Accepts the legacy
+    `user_id` (single int) keyword for backward compat.
     """
     if user_ids is None and user_id is not None:
         user_ids = user_id
@@ -291,12 +315,16 @@ def get_call(call_id: int, user_ids=None, user_id=None) -> Optional[sqlite3.Row]
     conn = get_conn()
     try:
         if user_ids is None:
-            return conn.execute("SELECT * FROM calls WHERE id = ?", (call_id,)).fetchone()
+            return conn.execute(
+                _CALLS_WITH_DURATION_SQL + " WHERE c.id = ?",
+                (call_id,),
+            ).fetchone()
         if not user_ids:
             return None
         placeholders = ",".join("?" for _ in user_ids)
         return conn.execute(
-            f"SELECT * FROM calls WHERE id = ? AND user_id IN ({placeholders})",
+            _CALLS_WITH_DURATION_SQL
+            + f" WHERE c.id = ? AND c.user_id IN ({placeholders})",
             (call_id, *user_ids),
         ).fetchone()
     finally:

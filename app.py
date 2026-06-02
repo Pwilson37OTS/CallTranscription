@@ -241,22 +241,16 @@ def ensure_transcript(call) -> str:
 # -----------------------------
 tab_names = ["Calls", "Call Log"]
 if user_is_admin:
-    tab_names.extend(["Templates", "Admin"])
+    tab_names.append("Admin")
 elif user_is_manager:
     tab_names.append("Team")
 
 tabs = st.tabs(tab_names)
 calls_tab = tabs[0]
 log_tab = tabs[1]
-templates_tab = tabs[2] if user_is_admin else None
 # admin_tab also serves as the Manager's "Team" tab — same code, scoped
 # by role inside the body.
-if user_is_admin:
-    admin_tab = tabs[3]
-elif user_is_manager:
-    admin_tab = tabs[2]
-else:
-    admin_tab = None
+admin_tab = tabs[2] if (user_is_admin or user_is_manager) else None
 
 
 # -----------------------------
@@ -278,11 +272,26 @@ with calls_tab:
         else:
             st.info("No calls available yet.")
     else:
-        # Dropdown selector — labels match the Call Log style: Recruiter |
-        # Contact (name or phone) | Date & time in Central Time.
+        # Dropdown selector — Recruiter | Contact | Date & time CT | Length.
         from zoneinfo import ZoneInfo as _ZI
         _UTC_TZ = _ZI("UTC")
         _CT_TZ = _ZI("America/Chicago")
+
+        def _fmt_call_length(secs) -> str:
+            if secs is None:
+                return "—"
+            try:
+                secs = int(secs)
+            except (TypeError, ValueError):
+                return "—"
+            if secs < 60:
+                return f"{secs}s"
+            if secs < 3600:
+                m, s = divmod(secs, 60)
+                return f"{m}m {s}s"
+            h, rem = divmod(secs, 3600)
+            m = rem // 60
+            return f"{h}h {m}m"
 
         def _call_label(row) -> str:
             recruiter = (row["recruiter_name"] or "").strip() or "—"
@@ -300,7 +309,12 @@ with calls_tab:
                 dt_str = dt_ct.strftime("%b %d, %I:%M %p CT")
             except Exception:
                 dt_str = (row["created_at"] or "")[:16]
-            return f"{recruiter} | {contact} | {dt_str}"
+            # Call duration carried by the LEFT JOIN with cloudcall_recordings.
+            try:
+                duration_str = _fmt_call_length(row["call_duration_seconds"])
+            except (IndexError, KeyError):
+                duration_str = "—"
+            return f"{recruiter} | {contact} | {dt_str} | {duration_str}"
 
         options = {_call_label(row): row["id"] for row in calls}
         # Explicit session-level key so the selection survives reruns triggered
@@ -320,12 +334,8 @@ with calls_tab:
             # reserved before the dropdown. Defined here (after the call is
             # known) so the call-type default reflects the current call.
             # -------------------------
-            coach_options = list(CALL_TEMPLATES.keys())
-            # Session-level call type: the user's choice persists across call
-            # changes and across reruns. The per-call key approach was losing
-            # the user's selection every time analyze_call or the poller
-            # triggered a rerun. On first render we seed it from the currently
-            # selected call's stored type; after that, session_state drives.
+            coach_options = list(CALL_TEMPLATES.keys())  # screening_call, post_interview_rundown
+            # Session-level call type persists across call changes and reruns.
             if "active_call_type" not in st.session_state:
                 st.session_state["active_call_type"] = (
                     call["call_type"]
@@ -344,35 +354,45 @@ with calls_tab:
                         format_func=lambda k: CALL_TEMPLATES[k]["label"],
                         key="active_call_type",
                     )
-
-                is_standard_call = selected_call_type == "standard_call"
-
                 with coach_right:
                     st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-                    if is_standard_call:
-                        analyze_clicked = False
-                    else:
-                        analyze_clicked = st.button(
-                            "Analyze Call",
-                            key=f"analyze_{call['id']}",
-                            use_container_width=True,
-                            disabled=not call["transcript_text"],
-                            help="Run a template-based coaching evaluation on the transcript.",
-                        )
+                    analyze_clicked = st.button(
+                        "Analyze Call",
+                        key=f"analyze_{call['id']}",
+                        use_container_width=True,
+                        disabled=not call["transcript_text"],
+                        help="Run the template below against the transcript.",
+                    )
 
-                if is_standard_call:
-                    st.info(
-                        "Standard calls don't get a coaching evaluation. Use the "
-                        "transcript below for your Bullhorn note. Switch to "
-                        "**Screening Call** or **Post Interview Rundown** if you "
-                        "want this call evaluated."
-                    )
-                else:
-                    st.caption(
-                        "Click **Analyze Call** once the transcript is ready to "
-                        "run a coaching evaluation against the template. Results "
-                        "appear at the bottom of the page."
-                    )
+                # Editable template text area. Pre-fills from the canonical
+                # template for the selected call type; the recruiter can edit
+                # before clicking Analyze. Edits persist per call type within
+                # the session (different call types keep separate edits).
+                template_state_key = f"template_text_{selected_call_type}"
+                if template_state_key not in st.session_state:
+                    st.session_state[template_state_key] = CALL_TEMPLATES[selected_call_type]["template"]
+
+                st.caption(
+                    "Template used for analysis. Edit freely — the version in this "
+                    "box (not the original) is what gets compared to the transcript."
+                )
+                template_text_input = st.text_area(
+                    "Template",
+                    height=320,
+                    key=template_state_key,
+                    label_visibility="collapsed",
+                )
+
+                reset_col, _spacer = st.columns([1, 5])
+                with reset_col:
+                    if st.button(
+                        "Reset to default",
+                        key=f"template_reset_{selected_call_type}",
+                        use_container_width=True,
+                        help="Restore the built-in template for this call type.",
+                    ):
+                        st.session_state[template_state_key] = CALL_TEMPLATES[selected_call_type]["template"]
+                        st.rerun()
 
                 st.markdown("---")
 
@@ -465,6 +485,11 @@ with calls_tab:
                 else:
                     try:
                         template_cfg = CALL_TEMPLATES[selected_call_type]
+                        # Use the recruiter's edited template from the text area,
+                        # not the canonical one.
+                        active_template = st.session_state.get(
+                            template_state_key, template_cfg["template"]
+                        )
                         logger.info(
                             "Call analysis started: user_id=%d call_id=%d call_type=%s",
                             current_user_id, call["id"], selected_call_type,
@@ -473,7 +498,7 @@ with calls_tab:
                             analysis_text = analyze_call(
                                 transcript_text=call["transcript_text"],
                                 call_type_label=template_cfg["label"],
-                                template=template_cfg["template"],
+                                template=active_template,
                                 metadata={
                                     "recruiter_name": call["recruiter_name"],
                                     "subject_name": call["subject_name"],
@@ -510,18 +535,17 @@ with calls_tab:
                         st.error(f"Analysis failed: {e}")
 
             # -------------------------
-            # Coaching analysis output AT THE BOTTOM (for non-standard types)
+            # Coaching analysis output AT THE BOTTOM
             # -------------------------
-            if not is_standard_call:
-                st.markdown("---")
-                st.markdown("### Call Analysis")
-                if call["summary_text"]:
-                    st.markdown(call["summary_text"])
-                else:
-                    st.caption(
-                        "_No analysis yet for this call. Click **Analyze Call** "
-                        "above to generate one._"
-                    )
+            st.markdown("---")
+            st.markdown("### Call Analysis")
+            if call["summary_text"]:
+                st.markdown(call["summary_text"])
+            else:
+                st.caption(
+                    "_No analysis yet for this call. Click **Analyze Call** "
+                    "above to generate one._"
+                )
 
 
 # -----------------------------
@@ -700,23 +724,6 @@ with log_tab:
                         st.write("—")
 
 
-# -----------------------------
-# Templates tab (admin-only reference view)
-# -----------------------------
-if templates_tab is not None:
-    with templates_tab:
-        st.subheader("Call Templates")
-        st.caption(
-            "Admin-only view of the templates the Analyze Call feature evaluates "
-            "transcripts against. To edit a template, modify call_templates.py "
-            "in the repo and redeploy — Streamlit picks up changes on the next "
-            "container start."
-        )
-
-        # Default-open the first one so the page lands on something visible
-        for i, (key, cfg) in enumerate(CALL_TEMPLATES.items()):
-            with st.expander(cfg["label"], expanded=(i == 0)):
-                st.markdown(cfg["template"])
 
 
 # -----------------------------

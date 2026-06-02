@@ -17,25 +17,6 @@ Editing templates:
 """
 
 CALL_TEMPLATES = {
-    "standard_call": {
-        "label": "Standard Call",
-        "template": """\
-Standard Call — no coaching evaluation needed.
-
-A standard recruiter call is any general conversation that doesn't fit a more
-specific category (screening, interview prep, post-interview rundown, etc.).
-The diarized transcript and the auto-generated Bullhorn-ready summary on the
-Calls tab are enough — no template-based evaluation is run for this call type.
-
-Use this category for:
-- General check-ins with candidates or clients
-- Quick informational calls
-- Status updates that don't warrant a full coaching review
-
-If a call should be evaluated, pick one of the other call types (Screening
-Call or Post Interview Rundown) instead.
-""",
-    },
     "screening_call": {
         "label": "Screening Call",
         "template": """\
