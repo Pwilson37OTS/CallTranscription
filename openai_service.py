@@ -219,6 +219,7 @@ def analyze_call(
     template: str,
     metadata: Dict[str, Any],
     model: str = "gpt-4.1",
+    technical_questions: str = "",
 ) -> str:
     """Evaluate a call transcript against a coaching template.
 
@@ -243,6 +244,19 @@ def analyze_call(
         "will read this feedback to improve."
     )
 
+    tech_block = ""
+    if technical_questions and technical_questions.strip():
+        tech_block = (
+            "RECRUITER-PROVIDED TECHNICAL SCREENING QUESTIONS:\n"
+            "(These are questions the recruiter intended to ask. Verify whether "
+            "each was actually asked in the transcript and capture the "
+            "candidate's verbatim response. Include this in the Technical "
+            "Screening Questions section of your output.)\n"
+            "----------\n"
+            f"{technical_questions.strip()}\n"
+            "----------\n\n"
+        )
+
     user_prompt = (
         f"Call Type: {call_type_label}\n"
         f"Recruiter: {recruiter}\n"
@@ -251,6 +265,7 @@ def analyze_call(
         "----------\n"
         f"{template}\n"
         "----------\n\n"
+        f"{tech_block}"
         "CALL TRANSCRIPT:\n"
         "----------\n"
         f"{transcript_text}\n"

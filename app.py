@@ -259,11 +259,6 @@ admin_tab = tabs[2] if (user_is_admin or user_is_manager) else None
 with calls_tab:
     st.subheader("Process a Call")
 
-    # Reserve a slot at the top of the page for the Call Coaching section.
-    # We render it later in the script (after we know which call is selected)
-    # but it displays here, above the call selector.
-    coaching_container = st.container()
-
     calls = get_all_calls(user_ids=scoped_user_ids)
 
     if not calls:
@@ -272,7 +267,7 @@ with calls_tab:
         else:
             st.info("No calls available yet.")
     else:
-        # Dropdown selector — Recruiter | Contact | Date & time CT | Length.
+        # Helpers for the dropdown label format.
         from zoneinfo import ZoneInfo as _ZI
         _UTC_TZ = _ZI("UTC")
         _CT_TZ = _ZI("America/Chicago")
@@ -297,8 +292,6 @@ with calls_tab:
             recruiter = (row["recruiter_name"] or "").strip() or "—"
             contact = (row["subject_name"] or "").strip()
             if not contact:
-                # Fall back to a readable identifier if subject_name is blank
-                # (older imports may not have the phone-number fallback).
                 of = row["original_filename"] or ""
                 contact = of if of and not of.startswith("cloudcall_") else "Unknown contact"
             try:
@@ -309,17 +302,25 @@ with calls_tab:
                 dt_str = dt_ct.strftime("%b %d, %I:%M %p CT")
             except Exception:
                 dt_str = (row["created_at"] or "")[:16]
-            # Call duration carried by the LEFT JOIN with cloudcall_recordings.
             try:
                 duration_str = _fmt_call_length(row["call_duration_seconds"])
             except (IndexError, KeyError):
                 duration_str = "—"
             return f"{recruiter} | {contact} | {dt_str} | {duration_str}"
 
+        # === Step 1: Call Type dropdown (first under Process a Call) ===
+        coach_options = list(CALL_TEMPLATES.keys())  # screening_call, post_interview_rundown
+        if "active_call_type" not in st.session_state:
+            st.session_state["active_call_type"] = coach_options[0]
+        selected_call_type = st.selectbox(
+            "Call Type",
+            options=coach_options,
+            format_func=lambda k: CALL_TEMPLATES[k]["label"],
+            key="active_call_type",
+        )
+
+        # === Step 2: Select a Call dropdown ===
         options = {_call_label(row): row["id"] for row in calls}
-        # Explicit session-level key so the selection survives reruns triggered
-        # by transcription, analysis, or background poller imports. Without
-        # this, the dropdown can silently reset to the first call mid-action.
         selected_label = st.selectbox(
             "Select a call",
             list(options.keys()),
@@ -329,76 +330,115 @@ with calls_tab:
         call = get_call(selected_id, user_ids=scoped_user_ids)
 
         if call:
-            # -------------------------
-            # Call Coaching section — rendered AT THE TOP via the container
-            # reserved before the dropdown. Defined here (after the call is
-            # known) so the call-type default reflects the current call.
-            # -------------------------
-            coach_options = list(CALL_TEMPLATES.keys())  # screening_call, post_interview_rundown
-            # Session-level call type persists across call changes and reruns.
-            if "active_call_type" not in st.session_state:
-                st.session_state["active_call_type"] = (
-                    call["call_type"]
-                    if call["call_type"] in coach_options
-                    else coach_options[0]
+            # Auto-transcribe up front so all downstream state — especially
+            # the disabled state of the Analyze button below — reflects the
+            # post-transcription transcript_text.
+            transcript_error = None
+            transcript_text = None
+            try:
+                transcript_text = ensure_transcript(call)
+                # Refresh `call` to pick up the new transcript_text the helper
+                # just wrote to the DB.
+                call = get_call(call["id"], user_ids=scoped_user_ids)
+            except Exception as e:
+                transcript_error = str(e)
+                logger.error(
+                    "Auto-transcribe failed: user_id=%d call_id=%d error=%s",
+                    current_user_id, call["id"], e,
                 )
 
-            with coaching_container:
-                st.markdown("### Call Coaching")
+            # === Step 3: Technical Screening Questions + Analyze Call ===
+            tq_col, btn_col = st.columns([4, 1])
+            with tq_col:
+                tech_questions_key = f"tech_questions_{call['id']}"
+                tech_questions = st.text_area(
+                    "Place Technical Screening Questions Here",
+                    height=140,
+                    key=tech_questions_key,
+                    placeholder=(
+                        "One per line. The analysis will verify whether each "
+                        "was asked and capture the candidate's verbatim response."
+                    ),
+                )
+            with btn_col:
+                st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+                analyze_clicked = st.button(
+                    "Analyze Call",
+                    key=f"analyze_{call['id']}",
+                    use_container_width=True,
+                    disabled=not call["transcript_text"],
+                    help="Run the coaching evaluation against the transcript.",
+                )
 
-                coach_left, coach_right = st.columns([3, 1])
-                with coach_left:
-                    selected_call_type = st.selectbox(
-                        "Call Type",
-                        options=coach_options,
-                        format_func=lambda k: CALL_TEMPLATES[k]["label"],
-                        key="active_call_type",
+            # Analyze action — runs before the analysis section renders below.
+            if analyze_clicked:
+                if not _check_rate_limit(current_user_id):
+                    st.error(
+                        f"Rate limit exceeded ({RATE_LIMIT_PER_HOUR} API calls/hour). Please wait."
                     )
-                with coach_right:
-                    st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
-                    analyze_clicked = st.button(
-                        "Analyze Call",
-                        key=f"analyze_{call['id']}",
-                        use_container_width=True,
-                        disabled=not call["transcript_text"],
-                        help="Run the template below against the transcript.",
-                    )
-
-                # Editable template text area. Pre-fills from the canonical
-                # template for the selected call type; the recruiter can edit
-                # before clicking Analyze. Edits persist per call type within
-                # the session (different call types keep separate edits).
-                template_state_key = f"template_text_{selected_call_type}"
-                if template_state_key not in st.session_state:
-                    st.session_state[template_state_key] = CALL_TEMPLATES[selected_call_type]["template"]
-
-                st.caption(
-                    "Template used for analysis. Edit freely — the version in this "
-                    "box (not the original) is what gets compared to the transcript."
-                )
-                template_text_input = st.text_area(
-                    "Template",
-                    height=320,
-                    key=template_state_key,
-                    label_visibility="collapsed",
-                )
-
-                reset_col, _spacer = st.columns([1, 5])
-                with reset_col:
-                    if st.button(
-                        "Reset to default",
-                        key=f"template_reset_{selected_call_type}",
-                        use_container_width=True,
-                        help="Restore the built-in template for this call type.",
-                    ):
-                        st.session_state[template_state_key] = CALL_TEMPLATES[selected_call_type]["template"]
+                    logger.warning("Rate limit hit on analyze: user_id=%d", current_user_id)
+                else:
+                    try:
+                        template_cfg = CALL_TEMPLATES[selected_call_type]
+                        logger.info(
+                            "Call analysis started: user_id=%d call_id=%d call_type=%s tech_q_chars=%d",
+                            current_user_id, call["id"], selected_call_type,
+                            len(tech_questions or ""),
+                        )
+                        with st.spinner("Analyzing call against template..."):
+                            analysis_text = analyze_call(
+                                transcript_text=call["transcript_text"],
+                                call_type_label=template_cfg["label"],
+                                template=template_cfg["template"],
+                                metadata={
+                                    "recruiter_name": call["recruiter_name"],
+                                    "subject_name": call["subject_name"],
+                                },
+                                model=DEFAULT_DIARIZATION_MODEL,
+                                technical_questions=tech_questions or "",
+                            )
+                        stored_analysis = (
+                            f"_Analyzed as: **{template_cfg['label']}**_\n\n{analysis_text}"
+                        )
+                        update_call(
+                            call["id"],
+                            call_type=selected_call_type,
+                            summary_text=stored_analysis,
+                        )
+                        _record_api_call(current_user_id)
+                        insert_api_usage({
+                            "user_id": current_user_id,
+                            "call_id": call["id"],
+                            "operation": "analysis",
+                            "model": DEFAULT_DIARIZATION_MODEL,
+                            "estimated_cost_cents": 0,
+                            "created_at": datetime.utcnow().isoformat(),
+                        })
+                        logger.info(
+                            "Call analysis complete: user_id=%d call_id=%d",
+                            current_user_id, call["id"],
+                        )
                         st.rerun()
+                    except Exception as e:
+                        logger.error(
+                            "Call analysis failed: user_id=%d call_id=%d error=%s",
+                            current_user_id, call["id"], e,
+                        )
+                        st.error(f"Analysis failed: {e}")
 
-                st.markdown("---")
+            # === Step 4: Call Analysis output (moved above the Details/Transcript) ===
+            st.markdown("---")
+            st.markdown("### Call Analysis")
+            if call["summary_text"]:
+                st.markdown(call["summary_text"])
+            else:
+                st.caption(
+                    "_No analysis yet for this call. Click **Analyze Call** "
+                    "above to generate one._"
+                )
 
-            # -------------------------
-            # Call details + transcript
-            # -------------------------
+            # === Step 5: Call Details + Transcript (now at the bottom) ===
+            st.markdown("---")
             left, right = st.columns([1, 2])
 
             with left:
@@ -448,104 +488,20 @@ with calls_tab:
                         st.rerun()
 
             with right:
-                # Transcript only. The Bullhorn-Ready Summary section was
-                # removed per user feedback — recruiters use the transcript
-                # directly for Standard Calls and the coaching analysis (below
-                # the columns) for Screening / Post Interview calls.
                 st.markdown("### Transcript")
-                try:
-                    transcript_text = ensure_transcript(call)
+                if transcript_error:
+                    st.error(f"Transcription failed: {transcript_error}")
+                    if st.button("Retry Transcription", key=f"retry_{call['id']}"):
+                        st.rerun()
+                else:
                     st.text_area(
                         "Transcript",
-                        value=transcript_text,
+                        value=transcript_text or "",
                         height=520,
                         disabled=True,
                         label_visibility="collapsed",
                         key=f"transcript_view_{call['id']}",
                     )
-                except Exception as e:
-                    logger.error(
-                        "Auto-transcribe failed: user_id=%d call_id=%d error=%s",
-                        current_user_id, call["id"], e,
-                    )
-                    st.error(f"Transcription failed: {e}")
-                    if st.button("Retry Transcription", key=f"retry_{call['id']}"):
-                        st.rerun()
-
-            # -------------------------
-            # Analyze action (triggered by the button up top in the coaching
-            # container). Output renders below the columns.
-            # -------------------------
-            if analyze_clicked:
-                if not _check_rate_limit(current_user_id):
-                    st.error(
-                        f"Rate limit exceeded ({RATE_LIMIT_PER_HOUR} API calls/hour). Please wait."
-                    )
-                    logger.warning("Rate limit hit on analyze: user_id=%d", current_user_id)
-                else:
-                    try:
-                        template_cfg = CALL_TEMPLATES[selected_call_type]
-                        # Use the recruiter's edited template from the text area,
-                        # not the canonical one.
-                        active_template = st.session_state.get(
-                            template_state_key, template_cfg["template"]
-                        )
-                        logger.info(
-                            "Call analysis started: user_id=%d call_id=%d call_type=%s",
-                            current_user_id, call["id"], selected_call_type,
-                        )
-                        with st.spinner("Analyzing call against template..."):
-                            analysis_text = analyze_call(
-                                transcript_text=call["transcript_text"],
-                                call_type_label=template_cfg["label"],
-                                template=active_template,
-                                metadata={
-                                    "recruiter_name": call["recruiter_name"],
-                                    "subject_name": call["subject_name"],
-                                },
-                                model=DEFAULT_DIARIZATION_MODEL,
-                            )
-                        stored_analysis = (
-                            f"_Analyzed as: **{template_cfg['label']}**_\n\n{analysis_text}"
-                        )
-                        update_call(
-                            call["id"],
-                            call_type=selected_call_type,
-                            summary_text=stored_analysis,
-                        )
-                        _record_api_call(current_user_id)
-                        insert_api_usage({
-                            "user_id": current_user_id,
-                            "call_id": call["id"],
-                            "operation": "analysis",
-                            "model": DEFAULT_DIARIZATION_MODEL,
-                            "estimated_cost_cents": 0,
-                            "created_at": datetime.utcnow().isoformat(),
-                        })
-                        logger.info(
-                            "Call analysis complete: user_id=%d call_id=%d",
-                            current_user_id, call["id"],
-                        )
-                        st.rerun()
-                    except Exception as e:
-                        logger.error(
-                            "Call analysis failed: user_id=%d call_id=%d error=%s",
-                            current_user_id, call["id"], e,
-                        )
-                        st.error(f"Analysis failed: {e}")
-
-            # -------------------------
-            # Coaching analysis output AT THE BOTTOM
-            # -------------------------
-            st.markdown("---")
-            st.markdown("### Call Analysis")
-            if call["summary_text"]:
-                st.markdown(call["summary_text"])
-            else:
-                st.caption(
-                    "_No analysis yet for this call. Click **Analyze Call** "
-                    "above to generate one._"
-                )
 
 
 # -----------------------------
