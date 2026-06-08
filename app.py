@@ -458,34 +458,72 @@ with calls_tab:
                     st.warning("Audio file not found in storage.")
 
                 st.markdown("---")
-                st.markdown("### Bullhorn Destination")
+                st.markdown("### Bullhorn Note")
                 contact_label = call["subject_name"] or "Unmatched contact"
                 st.info(
-                    f"Note will be attached to: **{contact_label}**\n\n"
-                    "_Bullhorn record matching arrives in Phase 2 — for now, submission is stubbed._"
+                    f"Paste the Call Analysis (above) into the Bullhorn record "
+                    f"for **{contact_label}**.\n\n"
+                    "_Version 2.0 will submit this automatically — for now, "
+                    "click Copy and paste manually._"
                 )
 
-                already_submitted = call["status"] == "submitted"
-                if already_submitted:
-                    st.success("This call has already been submitted.")
-
-                if st.button(
-                    "Submit to Bullhorn",
-                    key=f"submit_{call['id']}",
-                    type="primary",
-                    use_container_width=True,
-                    disabled=already_submitted,
-                ):
-                    if not call["transcript_text"]:
-                        st.error("Transcript not ready yet — please wait for transcription to complete.")
-                    else:
-                        update_call(call["id"], status="submitted")
-                        logger.info(
-                            "Stub Bullhorn submit: user_id=%d call_id=%d",
-                            current_user_id, call["id"],
-                        )
-                        st.success("Submitted to Bullhorn (stub — Phase 2 wires this to the real API).")
-                        st.rerun()
+                if call["summary_text"]:
+                    # Custom HTML button + clipboard API. Streamlit's native
+                    # buttons can't write to the clipboard from server-side
+                    # Python, so we drop a small inline JS handler. The
+                    # analysis text is JSON-escaped to safely embed in the
+                    # JS string (handles quotes, newlines, unicode, etc.).
+                    import json as _json
+                    import streamlit.components.v1 as _components
+                    _escaped_text = _json.dumps(call["summary_text"])
+                    _btn_id = f"copyBtn_{call['id']}"
+                    _components.html(
+                        f"""
+                        <button id="{_btn_id}"
+                            onclick='
+                                navigator.clipboard.writeText({_escaped_text}).then(() => {{
+                                    const b = document.getElementById("{_btn_id}");
+                                    const original = b.innerText;
+                                    b.innerText = "✓ Copied to clipboard";
+                                    b.style.background = "#28a745";
+                                    setTimeout(() => {{
+                                        b.innerText = original;
+                                        b.style.background = "linear-gradient(135deg, #0D2A39 0%, #36ADEC 100%)";
+                                    }}, 1800);
+                                }}).catch(err => {{
+                                    const b = document.getElementById("{_btn_id}");
+                                    b.innerText = "Copy failed — see console";
+                                    console.error(err);
+                                }});
+                            '
+                            style='
+                                width: 100%;
+                                box-sizing: border-box;
+                                padding: 0.6rem 1rem;
+                                background: linear-gradient(135deg, #0D2A39 0%, #36ADEC 100%);
+                                color: white;
+                                border: none;
+                                border-radius: 12px;
+                                font-weight: 600;
+                                cursor: pointer;
+                                font-family: inherit;
+                                font-size: 1rem;
+                                box-shadow: 0 8px 20px rgba(13,42,57,0.18);
+                                transition: transform 0.1s ease;
+                            '
+                            onmouseover='this.style.transform="translateY(-1px)";'
+                            onmouseout='this.style.transform="translateY(0)";'
+                        >
+                            Copy for Bullhorn
+                        </button>
+                        """,
+                        height=60,
+                    )
+                else:
+                    st.caption(
+                        "_Run **Analyze Call** above to generate an analysis "
+                        "that can be copied._"
+                    )
 
             with right:
                 st.markdown("### Transcript")
