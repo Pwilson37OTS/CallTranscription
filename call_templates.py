@@ -117,9 +117,6 @@ the recruiter should advise (list the item within the response):
 
 OOPS Section
 • List any questions or items from the previous sections that the recruiter forgot to cover with the candidate.
-
-Additional Notes
-• List any other notable details from the call that are not covered in the sections above.
 """,
     },
 }

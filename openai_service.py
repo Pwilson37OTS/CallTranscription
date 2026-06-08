@@ -300,6 +300,10 @@ def analyze_call(
         "## Covered Well, ## Not Covered Well Enough, ## Missed, still including "
         "verbatim quotes where applicable. Then add a note that the template is "
         "a placeholder and should be replaced with the real one.\n\n"
+        "6. Do NOT append any additional wrap-up sections (no Summary, no "
+        "Coaching Note, no Overall Assessment, no closing paragraph). The "
+        "template's own sections are the entire output. Stop after the last "
+        "section the template defines.\n\n"
         "Be honest but constructive. Quote accurately."
     )
 

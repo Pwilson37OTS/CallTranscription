@@ -458,64 +458,65 @@ with calls_tab:
                     st.warning("Audio file not found in storage.")
 
                 st.markdown("---")
-                st.markdown("### Bullhorn Note")
-                contact_label = call["subject_name"] or "Unmatched contact"
-                st.info(
-                    f"Paste the Call Analysis (above) into the Bullhorn record "
-                    f"for **{contact_label}**.\n\n"
-                    "_Version 2.0 will submit this automatically — for now, "
-                    "click Copy and paste manually._"
-                )
+                st.markdown("### Copy for Bullhorn")
 
                 if call["summary_text"]:
-                    # Custom HTML button + clipboard API. Streamlit's native
-                    # buttons can't write to the clipboard from server-side
-                    # Python, so we drop a small inline JS handler. The
-                    # analysis text is JSON-escaped to safely embed in the
-                    # JS string (handles quotes, newlines, unicode, etc.).
+                    # Streamlit's native buttons can't write to the browser
+                    # clipboard from Python, so we render an HTML button plus
+                    # a separate <script> block that attaches the click
+                    # handler. Keeping the JS out of an HTML attribute avoids
+                    # the apostrophe-in-analysis bug: if the analysis text
+                    # contains a single quote, an inline onclick='...'
+                    # attribute terminates early and the rest of the JS
+                    # spills onto the page as plain text.
                     import json as _json
                     import streamlit.components.v1 as _components
-                    _escaped_text = _json.dumps(call["summary_text"])
+                    _payload = _json.dumps(call["summary_text"])
                     _btn_id = f"copyBtn_{call['id']}"
                     _components.html(
                         f"""
-                        <button id="{_btn_id}"
-                            onclick='
-                                navigator.clipboard.writeText({_escaped_text}).then(() => {{
-                                    const b = document.getElementById("{_btn_id}");
-                                    const original = b.innerText;
-                                    b.innerText = "✓ Copied to clipboard";
-                                    b.style.background = "#28a745";
-                                    setTimeout(() => {{
-                                        b.innerText = original;
-                                        b.style.background = "linear-gradient(135deg, #0D2A39 0%, #36ADEC 100%)";
+                        <button id="{_btn_id}" style="
+                            width: 100%;
+                            box-sizing: border-box;
+                            padding: 0.6rem 1rem;
+                            background: linear-gradient(135deg, #0D2A39 0%, #36ADEC 100%);
+                            color: white;
+                            border: none;
+                            border-radius: 12px;
+                            font-weight: 600;
+                            cursor: pointer;
+                            font-family: inherit;
+                            font-size: 1rem;
+                            box-shadow: 0 8px 20px rgba(13,42,57,0.18);
+                            transition: transform 0.1s ease;
+                        ">Copy for Bullhorn</button>
+                        <script>
+                        (function() {{
+                            const payload = {_payload};
+                            const btn = document.getElementById("{_btn_id}");
+                            const defaultBg = "linear-gradient(135deg, #0D2A39 0%, #36ADEC 100%)";
+                            btn.addEventListener("mouseover", function() {{
+                                btn.style.transform = "translateY(-1px)";
+                            }});
+                            btn.addEventListener("mouseout", function() {{
+                                btn.style.transform = "translateY(0)";
+                            }});
+                            btn.addEventListener("click", function() {{
+                                navigator.clipboard.writeText(payload).then(function() {{
+                                    const original = btn.innerText;
+                                    btn.innerText = "Copied to clipboard";
+                                    btn.style.background = "#28a745";
+                                    setTimeout(function() {{
+                                        btn.innerText = original;
+                                        btn.style.background = defaultBg;
                                     }}, 1800);
-                                }}).catch(err => {{
-                                    const b = document.getElementById("{_btn_id}");
-                                    b.innerText = "Copy failed — see console";
+                                }}).catch(function(err) {{
+                                    btn.innerText = "Copy failed - see console";
                                     console.error(err);
                                 }});
-                            '
-                            style='
-                                width: 100%;
-                                box-sizing: border-box;
-                                padding: 0.6rem 1rem;
-                                background: linear-gradient(135deg, #0D2A39 0%, #36ADEC 100%);
-                                color: white;
-                                border: none;
-                                border-radius: 12px;
-                                font-weight: 600;
-                                cursor: pointer;
-                                font-family: inherit;
-                                font-size: 1rem;
-                                box-shadow: 0 8px 20px rgba(13,42,57,0.18);
-                                transition: transform 0.1s ease;
-                            '
-                            onmouseover='this.style.transform="translateY(-1px)";'
-                            onmouseout='this.style.transform="translateY(0)";'
-                        >
-                            Copy for Bullhorn
-                        </button>
+                            }});
+                        }})();
+                        </script>
                         """,
                         height=60,
                     )
