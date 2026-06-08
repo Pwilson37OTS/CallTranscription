@@ -21,7 +21,7 @@ from auth import (
 )
 from logging_config import logger
 from storage import storage
-from cloudcall_config import CLOUDCALL_ENABLED
+from cloudcall_config import CLOUDCALL_ENABLED, CLOUDCALL_RECORDING_RETENTION_HOURS
 
 # ============================================================
 # ECHO — Recruiter call review and coaching
@@ -549,6 +549,15 @@ with calls_tab:
 # -----------------------------
 with log_tab:
     # Header row: title + Pull from CloudCall button (moved from Calls tab)
+    # All three windows (cleanup retention, display, pull-lookback) read
+    # from the same config value so they always stay in sync. Pretty
+    # description for the caption: round up to whole days when possible.
+    _RET_HOURS = CLOUDCALL_RECORDING_RETENTION_HOURS
+    if _RET_HOURS % 24 == 0:
+        _RET_LABEL = f"{_RET_HOURS // 24} day{'s' if _RET_HOURS != 24 else ''}"
+    else:
+        _RET_LABEL = f"{_RET_HOURS} hours"
+
     if CLOUDCALL_ENABLED:
         log_col_title, log_col_refresh = st.columns([4, 1])
         with log_col_title:
@@ -557,12 +566,12 @@ with log_tab:
             if st.button(
                 "Pull from CloudCall",
                 key="log_refresh",
-                help="Check CloudCall for any new recordings from the last 72 hours.",
+                help=f"Check CloudCall for any new recordings from the last {_RET_LABEL}.",
             ):
                 try:
                     from cloudcall_service import poll_recent_recordings
                     with st.spinner("Checking CloudCall for new recordings..."):
-                        n = poll_recent_recordings(lookback_minutes=72 * 60)
+                        n = poll_recent_recordings(lookback_minutes=_RET_HOURS * 60)
                     if n > 0:
                         st.success(f"Found {n} new recording(s).")
                     else:
@@ -582,7 +591,7 @@ with log_tab:
         log_scope_note = f"Manager view — showing calls for **{team_label}** members."
     else:
         log_scope_note = "Showing only calls associated with your CloudCall account."
-    st.caption("CloudCall recordings from the last 72 hours. " + log_scope_note)
+    st.caption(f"CloudCall recordings from the last {_RET_LABEL}. " + log_scope_note)
 
     if not CLOUDCALL_ENABLED:
         st.info("CloudCall integration is not enabled.")
@@ -598,10 +607,10 @@ with log_tab:
         # see only their own. Filtering is by app_user_id set when the poller
         # matched a CloudCall user mapping. Recordings without a mapping are
         # invisible to non-admins by design.
-        recordings = _get_cc_recs(user_ids=scoped_user_ids, hours=72)
+        recordings = _get_cc_recs(user_ids=scoped_user_ids, hours=_RET_HOURS)
 
         if not recordings:
-            st.info("No CloudCall recordings in the last 72 hours.")
+            st.info(f"No CloudCall recordings in the last {_RET_LABEL}.")
         else:
             def _fmt_length(secs):
                 if secs is None:
