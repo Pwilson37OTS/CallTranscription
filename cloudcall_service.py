@@ -683,15 +683,23 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
         _cc_conn.close()
 
     inserted = 0
+    inserted_no_audio = 0
     skipped_known = 0
+    skipped_no_call_id = 0
+    url_fetch_failed = 0
     for call in calls:
         call_data_id = call.get("user_call_data_id", "")
         if not call_data_id:
+            skipped_no_call_id += 1
             continue
 
-        # Skip calls with 0 recording duration (voicemails without actual recordings)
-        if call.get("recording_duration", 0) == 0:
-            continue
+        # NOTE: previously this block also skipped calls with
+        # recording_duration == 0, on the theory they were voicemails
+        # without recordings. But CloudCall also reports duration=0 for
+        # calls where the audio file is missing on their side — and the
+        # recruiter still wants visibility into those. We now let them
+        # through; if the URL fetch confirms there's no audio, the row
+        # gets inserted with status=no_audio for explicit display.
 
         # Already have this one — skip the URL fetch entirely.
         if call_data_id in known_ids:
@@ -703,6 +711,7 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
             rec_url = get_recording_url(call_data_id)
         except Exception as e:
             logger.warning("Failed to get recording URL for %s: %s", call_data_id, e)
+            url_fetch_failed += 1
             continue
 
         # CloudCall sometimes flags a call as is_recorded=1 but its audio
@@ -755,6 +764,8 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
                 "webhook_payload": "",
             })
             inserted += 1
+            if record_status == "no_audio":
+                inserted_no_audio += 1
             logger.info(
                 "Polled recording: %s user=%s (%s) contact=%s duration=%ds status=%s",
                 call_data_id, call.get("user_name", ""), cloudcall_user_id,
@@ -794,9 +805,13 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
                     call_data_id, recording_db_id, e,
                 )
 
+    inserted_with_audio = inserted - inserted_no_audio
     logger.info(
-        "Polling complete: %d new recordings inserted from %d total calls (%d already known)",
-        inserted, len(calls), skipped_known,
+        "Polling complete: %d total calls from CloudCall | %d inserted with audio | "
+        "%d inserted as no_audio | %d already known (skipped) | "
+        "%d had no call_data_id (skipped) | %d had URL fetch errors (skipped)",
+        len(calls), inserted_with_audio, inserted_no_audio, skipped_known,
+        skipped_no_call_id, url_fetch_failed,
     )
 
     # Opportunistic cleanup
