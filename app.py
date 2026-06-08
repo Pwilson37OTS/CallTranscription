@@ -1027,7 +1027,11 @@ if admin_tab is not None:
 
         # --- CloudCall Ingest Stats (Admin only — system-wide) ---
         if CLOUDCALL_ENABLED and user_is_admin:
-            from cloudcall_service import get_cloudcall_ingest_stats, reimport_unmapped_recordings
+            from cloudcall_service import (
+                get_cloudcall_ingest_stats,
+                reimport_unmapped_recordings,
+                revalidate_imported_recordings,
+            )
 
             st.markdown("---")
             st.markdown("### CloudCall Ingest Status")
@@ -1079,6 +1083,36 @@ if admin_tab is not None:
                 except Exception as e:
                     logger.error("Re-import failed: user_id=%d error=%s", current_user_id, e)
                     st.error(f"Re-import failed: {e}")
+
+            st.caption(
+                "**Re-validate stored recordings** — audits every imported call's "
+                "on-disk audio file. Any with missing or suspiciously small files "
+                "(common when CloudCall reported a valid URL but the actual file "
+                "was a placeholder) get re-tagged as no_audio and removed from "
+                "the recruiter dropdown."
+            )
+            if st.button(
+                "Re-validate Stored Recordings",
+                key="revalidate_btn",
+                help="Check on-disk audio files for every imported call; fix bad ones.",
+            ):
+                try:
+                    with st.spinner("Auditing stored audio files..."):
+                        result = revalidate_imported_recordings()
+                    st.success(
+                        f"Checked {result['checked']} imported recording(s); "
+                        f"{result['fixed']} had invalid audio and were fixed "
+                        f"(marked no_audio + removed from Calls dropdown); "
+                        f"{result['errors']} errors during audit."
+                    )
+                    logger.info(
+                        "Admin revalidate: user_id=%d result=%s",
+                        current_user_id, result,
+                    )
+                    st.rerun()
+                except Exception as e:
+                    logger.error("Re-validate failed: user_id=%d error=%s", current_user_id, e)
+                    st.error(f"Re-validate failed: {e}")
 
         # --- CloudCall User Mappings ---
         if CLOUDCALL_ENABLED:

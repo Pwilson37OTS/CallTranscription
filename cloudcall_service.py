@@ -192,8 +192,34 @@ def download_recording(recording_url: str, cloudcall_recording_id: str) -> Path:
 
         response.raise_for_status()
 
+    # Validate that what came back is actually audio. CloudCall has been
+    # observed to return small HTML error pages or placeholder bodies for
+    # calls where the audio file doesn't actually exist on their side
+    # (their UI shows "an audio file does not exist" for these). The HTTP
+    # status is 200 so response.raise_for_status() lets it through, but
+    # the payload is junk and import_recording_to_pipeline used to mark
+    # these as 'imported' — they'd then appear in the Calls dropdown but
+    # transcription would fail (or produce garbage). Catch them here so
+    # they get tagged status="no_audio" by the import exception handler.
+    content_type = (response.headers.get("content-type") or "").lower()
+    body_size = len(response.content)
+
+    # Text / JSON / XML payloads are never audio.
+    if content_type.startswith(("text/", "application/json", "application/xml", "application/problem+json")):
+        raise RuntimeError(
+            f"Recording has no audio content (content-type={content_type or 'unknown'}, "
+            f"size={body_size} bytes)"
+        )
+
+    # Any reasonable phone recording is at least a few KB. Sub-1KB
+    # responses are almost certainly placeholders or error stubs that
+    # slipped past the content-type check.
+    if body_size < 1024:
+        raise RuntimeError(
+            f"Recording has no audio content (only {body_size} bytes returned)"
+        )
+
     # Determine file extension from content-type or URL
-    content_type = response.headers.get("content-type", "")
     if "wav" in content_type or recording_url.endswith(".wav"):
         ext = ".wav"
     elif "mp3" in content_type or "mpeg" in content_type or recording_url.endswith(".mp3"):
@@ -335,7 +361,12 @@ def import_recording_to_pipeline(
         # no audio.
         err_str = str(e)
         err_lower = err_str.lower()
-        no_audio_markers = ("no longer available", "empty (0 bytes)", "0 bytes")
+        no_audio_markers = (
+            "no longer available",
+            "empty (0 bytes)",
+            "0 bytes",
+            "no audio content",  # raised by download_recording when payload is invalid
+        )
         is_missing_audio = any(m in err_lower for m in no_audio_markers)
         final_status = "no_audio" if is_missing_audio else "error"
         update_cloudcall_recording(
@@ -471,6 +502,104 @@ def get_storage_breakdown() -> list:
         items.append({"path": label, "files": count, "size_bytes": size})
 
     return items
+
+
+def revalidate_imported_recordings() -> dict:
+    """Audit every status='imported' CloudCall recording for a valid audio file.
+
+    Used to clean up rows that were imported before download-time validation
+    existed (or where CloudCall served a tiny/invalid placeholder). For each
+    row we look up the linked calls.stored_path; if the file is missing or
+    suspiciously small, the recording is marked status='no_audio', the
+    linked calls row is deleted, and the on-disk file is removed.
+
+    Returns dict with: checked, fixed, errors.
+    """
+    from cloudcall_db import (
+        get_conn as _cc_get_conn,
+        update_cloudcall_recording as _update_rec,
+    )
+    from db import get_call as _get_call, get_conn as _get_conn
+    from config import APP_DIR
+
+    MIN_AUDIO_BYTES = 1024  # match download-time threshold
+
+    cc_conn = _cc_get_conn()
+    try:
+        rows = cc_conn.execute(
+            "SELECT id, imported_call_id FROM cloudcall_recordings "
+            "WHERE status = 'imported' AND imported_call_id IS NOT NULL"
+        ).fetchall()
+    finally:
+        cc_conn.close()
+
+    checked = 0
+    fixed = 0
+    errors = 0
+
+    for row in rows:
+        checked += 1
+        rec_id = row["id"]
+        call_id = row["imported_call_id"]
+
+        try:
+            call = _get_call(call_id)
+            if not call:
+                continue
+
+            stored_path_str = call["stored_path"] if call["stored_path"] else ""
+            if not stored_path_str:
+                continue
+
+            full_path = APP_DIR / stored_path_str
+            file_invalid = False
+            err_reason = ""
+
+            if not full_path.exists():
+                file_invalid = True
+                err_reason = "audio file missing on disk"
+            else:
+                size = full_path.stat().st_size
+                if size < MIN_AUDIO_BYTES:
+                    file_invalid = True
+                    err_reason = f"audio file too small ({size} bytes — likely a placeholder)"
+
+            if not file_invalid:
+                continue
+
+            # Mark the CloudCall recording row as no_audio with the reason
+            _update_rec(
+                rec_id,
+                status="no_audio",
+                error_message=f"Re-validation: {err_reason}",
+            )
+
+            # Delete the linked calls row (it points at invalid audio; we
+            # don't want this call appearing in any recruiter's dropdown).
+            del_conn = _get_conn()
+            try:
+                del_conn.execute("DELETE FROM calls WHERE id = ?", (call_id,))
+                del_conn.commit()
+            finally:
+                del_conn.close()
+
+            # Remove the on-disk file if it's there
+            try:
+                if full_path.exists():
+                    full_path.unlink()
+            except OSError as ose:
+                logger.warning("Could not delete file %s: %s", full_path, ose)
+
+            fixed += 1
+            logger.info(
+                "Re-validation: rec_id=%d call_id=%d reason=%r -> status=no_audio, call row deleted",
+                rec_id, call_id, err_reason,
+            )
+        except Exception as e:
+            errors += 1
+            logger.warning("Re-validation failed for recording id=%d: %s", rec_id, e)
+
+    return {"checked": checked, "fixed": fixed, "errors": errors}
 
 
 def reimport_unmapped_recordings() -> dict:
