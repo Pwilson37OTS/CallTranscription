@@ -705,8 +705,22 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
             logger.warning("Failed to get recording URL for %s: %s", call_data_id, e)
             continue
 
-        if not rec_url:
-            continue
+        # CloudCall sometimes flags a call as is_recorded=1 but its audio
+        # file is missing on their side (their UI shows "an audio file does
+        # not exist"). Previously we silently dropped those — the recruiter
+        # never knew the call existed. Now we insert a row with
+        # status="no_audio" so it shows up in the Call Log with a clear
+        # indicator, and the Import button is disabled for it.
+        if rec_url:
+            record_status = "available"
+            url_to_store = rec_url
+        else:
+            record_status = "no_audio"
+            url_to_store = ""  # column is NOT NULL — use empty placeholder
+            logger.info(
+                "CloudCall has no audio file for call %s — storing with status=no_audio",
+                call_data_id,
+            )
 
         # Map CloudCall user to app user
         cloudcall_user_id = call.get("cloudcall_user_id", "")
@@ -728,7 +742,7 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
                 "cloudcall_recording_id": call_data_id,
                 "cloudcall_user_id": cloudcall_user_id,
                 "app_user_id": app_user_id,
-                "recording_url": rec_url,
+                "recording_url": url_to_store,
                 "recruiter_name": call.get("user_name", ""),
                 "contact_name": call.get("contact_name", ""),
                 "caller_number": call.get("user_number", ""),
@@ -736,15 +750,15 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
                 "direction": call.get("direction", ""),
                 "call_duration_seconds": call.get("duration"),
                 "call_timestamp": call.get("created_on", now.isoformat()),
-                "status": "available",
+                "status": record_status,
                 "webhook_received_at": now.isoformat(),
                 "webhook_payload": "",
             })
             inserted += 1
             logger.info(
-                "Polled recording: %s user=%s (%s) contact=%s duration=%ds",
+                "Polled recording: %s user=%s (%s) contact=%s duration=%ds status=%s",
                 call_data_id, call.get("user_name", ""), cloudcall_user_id,
-                call.get("contact_name", ""), call.get("duration", 0),
+                call.get("contact_name", ""), call.get("duration", 0), record_status,
             )
         except Exception as e:
             if "UNIQUE constraint" in str(e):
@@ -753,10 +767,10 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
                 logger.error("Failed to insert polled recording %s: %s", call_data_id, e)
                 continue
 
-        # Auto-import: if the recording is mapped to an app user, download +
-        # convert + insert into the calls table now so it shows up immediately
-        # in that recruiter's view without a manual import click.
-        if recording_db_id and app_user_id:
+        # Auto-import: only for recordings with an actual audio file. The
+        # "no_audio" rows are just visibility placeholders — there's nothing
+        # to download or transcribe.
+        if recording_db_id and app_user_id and record_status == "available":
             try:
                 # Prefer the contact name; fall back to the phone number when
                 # CloudCall didn't know the contact (cold call to unknown number).

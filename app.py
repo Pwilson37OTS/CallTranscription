@@ -682,6 +682,9 @@ with log_tab:
                             st.caption(err_msg[:80] + ("…" if len(err_msg) > 80 else ""))
                     elif status == "importing":
                         st.write("Importing…")
+                    elif status == "no_audio":
+                        st.write("⚠ No Audio")
+                        st.caption("CloudCall has no recording file for this call.")
                     else:
                         st.write(status.title() if status else "—")
 
@@ -689,7 +692,9 @@ with log_tab:
                 with row[6]:
                     importable = status in ("available", "error")
                     target_user_id = r["app_user_id"]
-                    if importable and target_user_id is None:
+                    if status == "no_audio":
+                        st.caption("_No file_")
+                    elif importable and target_user_id is None:
                         st.caption("_Needs mapping_")
                     elif importable:
                         if st.button("Import", key=f"log_import_{r['id']}", use_container_width=True):
