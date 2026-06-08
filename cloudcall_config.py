@@ -23,7 +23,12 @@ CLOUDCALL_REFRESH_TOKEN = os.getenv("CLOUDCALL_REFRESH_TOKEN", "")
 CLOUDCALL_WEBHOOK_SIGNING_KEY = os.getenv("CLOUDCALL_WEBHOOK_SIGNING_KEY", "")
 
 # Recording retention (hours) — recordings older than this are auto-purged
-CLOUDCALL_RECORDING_RETENTION_HOURS = int(os.getenv("CLOUDCALL_RECORDING_RETENTION_HOURS", "72"))
+# from the local DB and disk. The Call Log display window and the manual
+# "Pull from CloudCall" lookback both use the same value, so all three
+# stay in sync. Default 168h = 7 days; covers Friday-Monday gaps and
+# gives admins time to investigate missing-audio calls before they age
+# out. Override via the env var on Railway if more or less is needed.
+CLOUDCALL_RECORDING_RETENTION_HOURS = int(os.getenv("CLOUDCALL_RECORDING_RETENTION_HOURS", "168"))
 
 # Polling settings
 CLOUDCALL_POLL_INTERVAL_MINUTES = int(os.getenv("CLOUDCALL_POLL_INTERVAL_MINUTES", "5"))

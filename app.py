@@ -24,11 +24,11 @@ from storage import storage
 from cloudcall_config import CLOUDCALL_ENABLED
 
 # ============================================================
-# Recruiter Call Review Tool
+# ECHO — Recruiter call review and coaching
 # Run with: streamlit run app.py
 # ============================================================
 
-st.set_page_config(page_title="Recruiter Call Review Tool", layout="wide")
+st.set_page_config(page_title="ECHO", layout="wide")
 
 # --- Startup guard: require OpenAI API key ---
 if not os.getenv("OPENAI_API_KEY"):
@@ -79,7 +79,8 @@ def show_login_page():
     with col_center:
         if LOGO_PATH.exists():
             st.image(str(LOGO_PATH), width=150)
-        st.markdown("### Recruiter Call Review Tool")
+        st.markdown("### ECHO")
+        st.caption("Recruiter call review and coaching.")
         st.markdown("Sign in to continue.")
 
         with st.form("login_form"):
@@ -161,7 +162,7 @@ with hero_right:
     st.markdown(
         """
         <div class="brand-hero">
-            <h1>Recruiter Call Review Tool</h1>
+            <h1>ECHO</h1>
             <p>Select a call, review the transcript, and submit it to Bullhorn as a note.</p>
         </div>
         """,

@@ -1,6 +1,6 @@
 # Deployment Runbook
 
-Internal-network deployment of the Recruiter Call Review Tool using Docker
+Internal-network deployment of ECHO (the recruiter call review tool) using Docker
 Compose. The image runs four supervised processes (Streamlit, FastAPI
 webhook receiver, CloudCall poller, nginx front-door) inside one container.
 

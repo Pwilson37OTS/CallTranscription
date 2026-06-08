@@ -1,4 +1,4 @@
-# Recruiter Call Review Tool
+# ECHO — Recruiter Call Review
 
 Upload recruiter call recordings, automatically transcribe them via OpenAI, and generate ATS-ready summaries with call-type-specific formatting.
 
