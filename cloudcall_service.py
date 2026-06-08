@@ -548,37 +548,64 @@ def get_cloudcall_ingest_stats() -> dict:
 # ---------------------------------------------------------------------------
 
 
-def fetch_call_logs(from_dt: str, to_dt: str, page: int = 1, rows: int = 100) -> list:
-    """Fetch call logs from CloudCall API, filtered to recorded calls only.
+def fetch_call_logs(from_dt: str, to_dt: str, rows: int = 100, max_pages: int = 50) -> list:
+    """Fetch ALL pages of call logs from CloudCall in the time range.
+
+    Previously this only fetched page 1 (100 results). With multiple
+    recruiters making 14+ recorded calls a day each, a 72-hour window
+    can easily contain 300+ calls. Results are ordered DESC by created_on,
+    so page 1 = the 100 most recent calls; older calls in the window were
+    silently dropped, even when CloudCall had them and we asked for them.
+
+    Now we loop pages 1..max_pages, stopping when a page returns fewer
+    than `rows` results (= last page) or when max_pages is hit (safety
+    cap to prevent runaway loops).
 
     Args:
         from_dt: Start datetime ISO string (e.g. "2026-03-31T06:00:00")
         to_dt: End datetime ISO string
-        page: Page number (1-based)
-        rows: Results per page
+        rows: Page size (CloudCall limit applies — 100 is typical max)
+        max_pages: Hard cap to avoid infinite loops; 50 pages = 5,000 calls.
 
     Returns:
-        List of call log dicts from CloudCall API.
+        List of all call log dicts in the window.
     """
+    all_calls: list = []
     token = get_access_token()
-    with httpx.Client(timeout=30.0) as client:
-        response = client.post(
-            f"{CLOUDCALL_API_BASE_URL}/report/call_logs",
-            headers={"Authorization": f"Bearer {token}"},
-            json={
-                "from": from_dt,
-                "to": to_dt,
-                "pagination": {"rows": rows, "pgnum": page},
-                "order_by": [{"dimension": "created_on", "order": "DESC"}],
-                "filter": [
-                    {"dimension": "is_recorded", "logical_op": "AND", "values": ["1"]},
-                ],
-            },
-        )
-        response.raise_for_status()
 
-    data = response.json()
-    return data.get("Data", [])
+    with httpx.Client(timeout=30.0) as client:
+        for page in range(1, max_pages + 1):
+            response = client.post(
+                f"{CLOUDCALL_API_BASE_URL}/report/call_logs",
+                headers={"Authorization": f"Bearer {token}"},
+                json={
+                    "from": from_dt,
+                    "to": to_dt,
+                    "pagination": {"rows": rows, "pgnum": page},
+                    "order_by": [{"dimension": "created_on", "order": "DESC"}],
+                    "filter": [
+                        {"dimension": "is_recorded", "logical_op": "AND", "values": ["1"]},
+                    ],
+                },
+            )
+            response.raise_for_status()
+            page_calls = response.json().get("Data", []) or []
+            if not page_calls:
+                break
+            all_calls.extend(page_calls)
+            if len(page_calls) < rows:
+                # Partial page = last page; stop here.
+                break
+        else:
+            # Hit max_pages without an early break. Log so we know to bump
+            # the cap if real call volume ever exceeds 5,000 in the window.
+            logger.warning(
+                "fetch_call_logs hit max_pages=%d; some calls may have been dropped",
+                max_pages,
+            )
+
+    logger.info("fetch_call_logs: %d total calls across %d page(s)", len(all_calls), page)
+    return all_calls
 
 
 def get_recording_url(user_call_data_id: str) -> Optional[str]:
@@ -639,7 +666,24 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
         logger.info("No recorded calls found in polling window")
         return 0
 
+    # Pre-fetch every cloudcall_recording_id we already have so we can
+    # skip the per-call URL fetch for duplicates. Without this, a 72-hour
+    # re-pull over 300 calls would fire 300 URL requests at CloudCall even
+    # though 99% would be no-ops at the insert step.
+    from cloudcall_db import get_conn as _cc_get_conn
+    _cc_conn = _cc_get_conn()
+    try:
+        known_ids = {
+            r["cloudcall_recording_id"]
+            for r in _cc_conn.execute(
+                "SELECT cloudcall_recording_id FROM cloudcall_recordings"
+            ).fetchall()
+        }
+    finally:
+        _cc_conn.close()
+
     inserted = 0
+    skipped_known = 0
     for call in calls:
         call_data_id = call.get("user_call_data_id", "")
         if not call_data_id:
@@ -647,6 +691,11 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
 
         # Skip calls with 0 recording duration (voicemails without actual recordings)
         if call.get("recording_duration", 0) == 0:
+            continue
+
+        # Already have this one — skip the URL fetch entirely.
+        if call_data_id in known_ids:
+            skipped_known += 1
             continue
 
         # Fetch recording URL
@@ -731,7 +780,10 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
                     call_data_id, recording_db_id, e,
                 )
 
-    logger.info("Polling complete: %d new recordings inserted from %d calls", inserted, len(calls))
+    logger.info(
+        "Polling complete: %d new recordings inserted from %d total calls (%d already known)",
+        inserted, len(calls), skipped_known,
+    )
 
     # Opportunistic cleanup
     maybe_cleanup_expired()
