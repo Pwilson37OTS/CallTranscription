@@ -328,14 +328,24 @@ def import_recording_to_pipeline(
         return new_call_id
 
     except Exception as e:
+        # Distinguish "the audio file genuinely doesn't exist" from
+        # everything else (network blips, conversion errors, etc.) so the
+        # Call Log can show a clear "Missing recording" label and disable
+        # the retry button — there's nothing to retry when CloudCall has
+        # no audio.
+        err_str = str(e)
+        err_lower = err_str.lower()
+        no_audio_markers = ("no longer available", "empty (0 bytes)", "0 bytes")
+        is_missing_audio = any(m in err_lower for m in no_audio_markers)
+        final_status = "no_audio" if is_missing_audio else "error"
         update_cloudcall_recording(
             cloudcall_recording_db_id,
-            status="error",
-            error_message=str(e)[:500],
+            status=final_status,
+            error_message=err_str[:500],
         )
         logger.error(
-            "Import failed for CloudCall recording %d: %s",
-            cloudcall_recording_db_id, e,
+            "Import failed for CloudCall recording %d (status=%s): %s",
+            cloudcall_recording_db_id, final_status, e,
         )
         raise
     finally:

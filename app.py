@@ -683,30 +683,48 @@ with log_tab:
                 # Status
                 with row[5]:
                     status = (r["status"] or "").lower()
-                    if status == "imported":
+                    err_msg = r["error_message"] if "error_message" in r.keys() else ""
+                    # Treat error rows that failed due to missing audio
+                    # (download was empty, URL no longer available, etc.)
+                    # as no_audio for display purposes — without doing a
+                    # DB migration on existing rows. Going forward,
+                    # import_recording_to_pipeline tags these as no_audio
+                    # directly so this fallback handles legacy rows only.
+                    _err_lower = (err_msg or "").lower()
+                    _looks_like_no_audio = (
+                        "no longer available" in _err_lower
+                        or "empty (0 bytes)" in _err_lower
+                        or "0 bytes" in _err_lower
+                    )
+                    effective_status = status
+                    if status == "error" and _looks_like_no_audio:
+                        effective_status = "no_audio"
+
+                    if effective_status == "imported":
                         st.write("✓ Imported")
-                    elif status == "error":
-                        err_msg = r["error_message"] if "error_message" in r.keys() else ""
+                    elif effective_status == "no_audio":
+                        st.write("⚠ No Audio")
+                        st.caption("CloudCall has no recording file for this call.")
+                    elif effective_status == "error":
                         st.write("⚠ Error")
                         if err_msg:
                             st.caption(err_msg[:80] + ("…" if len(err_msg) > 80 else ""))
-                    elif status == "importing":
+                    elif effective_status == "importing":
                         st.write("Importing…")
-                    elif status == "no_audio":
-                        st.write("⚠ No Audio")
-                        st.caption("CloudCall has no recording file for this call.")
                     else:
-                        st.write(status.title() if status else "—")
+                        st.write(effective_status.title() if effective_status else "—")
 
                 # Import action
                 with row[6]:
-                    importable = status in ("available", "error")
                     target_user_id = r["app_user_id"]
-                    if status == "no_audio":
-                        st.caption("_No file_")
-                    elif importable and target_user_id is None:
+                    if effective_status == "no_audio":
+                        # Same column as "Needs mapping" — clear, italicized
+                        # caption tells the recruiter exactly why this call
+                        # won't appear in the Calls-tab dropdown.
+                        st.caption("_Missing recording_")
+                    elif effective_status in ("available", "error") and target_user_id is None:
                         st.caption("_Needs mapping_")
-                    elif importable:
+                    elif effective_status in ("available", "error"):
                         if st.button("Import", key=f"log_import_{r['id']}", use_container_width=True):
                             try:
                                 with st.spinner("Importing…"):
