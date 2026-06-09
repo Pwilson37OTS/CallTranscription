@@ -386,6 +386,15 @@ with calls_tab:
                             current_user_id, call["id"], selected_call_type,
                             len(tech_questions or ""),
                         )
+                        # Format the call's created_at (UTC ISO string) for
+                        # the analysis header. Falls back to the raw string
+                        # if parsing fails.
+                        try:
+                            _call_dt = datetime.fromisoformat(call["created_at"])
+                            _call_dt_str = _call_dt.strftime("%Y-%m-%d %H:%M UTC")
+                        except Exception:
+                            _call_dt_str = call["created_at"] or ""
+
                         with st.spinner("Analyzing call against template..."):
                             analysis_text = analyze_call(
                                 transcript_text=call["transcript_text"],
@@ -394,6 +403,7 @@ with calls_tab:
                                 metadata={
                                     "recruiter_name": call["recruiter_name"],
                                     "subject_name": call["subject_name"],
+                                    "call_timestamp": _call_dt_str,
                                 },
                                 model=DEFAULT_DIARIZATION_MODEL,
                                 technical_questions=tech_questions or "",

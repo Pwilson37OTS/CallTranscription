@@ -221,10 +221,13 @@ def analyze_call(
     model: str = "gpt-4.1",
     technical_questions: str = "",
 ) -> str:
-    """Evaluate a call transcript against a coaching template.
+    """Produce a candidate information note from the call transcript.
 
-    Returns a markdown evaluation with three sections:
-    Covered Well, Not Covered Well Enough, Missed.
+    The output is a structured note about the candidate, organized by the
+    sections in the template. Each question is followed by the candidate's
+    response (summarized for readability, comprehensive for technical
+    screening questions). It's a record FOR the candidate's file, not a
+    recruiter coaching evaluation.
     """
     logger.info(
         "Call analysis started: model=%s call_type=%s chars=%d",
@@ -233,25 +236,29 @@ def analyze_call(
 
     recruiter = (metadata.get("recruiter_name") or "").strip() or "the recruiter"
     subject = (metadata.get("subject_name") or "").strip() or "the contact"
+    call_timestamp = (metadata.get("call_timestamp") or "").strip()
 
     system_prompt = (
-        "You are a recruiter call coach. The user will give you a call transcript "
-        "and an evaluation template. Follow the template precisely — its sections, "
-        "structure, and instructions all guide your output. For every point listed "
-        "in the template, evaluate whether the recruiter addressed it based on the "
-        "transcript. Cite or paraphrase the transcript briefly to support each "
-        f"finding. Be specific, direct, and constructive — the recruiter ({recruiter}) "
-        "will read this feedback to improve."
+        "You are a recruiting assistant for OakTree Staffing. The user will "
+        "give you a transcript of a recruiter screening call plus an "
+        "evaluation template listing the questions and topics the recruiter "
+        "should have covered. Your job is to produce a clean, structured "
+        "candidate information note suitable for pasting into the candidate's "
+        "record in the ATS (Bullhorn). This is an informational document "
+        "ABOUT THE CANDIDATE — not a recruiter performance review."
     )
 
     tech_block = ""
     if technical_questions and technical_questions.strip():
         tech_block = (
-            "RECRUITER-PROVIDED TECHNICAL SCREENING QUESTIONS:\n"
-            "(These are questions the recruiter intended to ask. Verify whether "
-            "each was actually asked in the transcript and capture the "
-            "candidate's verbatim response. Include this in the Technical "
-            "Screening Questions section of your output.)\n"
+            "TECHNICAL SCREENING QUESTIONS PROVIDED BY THE RECRUITER:\n"
+            "(These are the questions the recruiter intended to ask. In your "
+            "Technical Screening Questions section, list each one in order "
+            "and capture the candidate's COMPLETE answer from the transcript. "
+            "Do not truncate, abbreviate, or omit details. Include every "
+            "specific fact the candidate mentioned: years of experience, "
+            "project names, dollar amounts, durations, technologies, tools, "
+            "company names, dates, team sizes, etc.)\n"
             "----------\n"
             f"{technical_questions.strip()}\n"
             "----------\n\n"
@@ -260,51 +267,64 @@ def analyze_call(
     user_prompt = (
         f"Call Type: {call_type_label}\n"
         f"Recruiter: {recruiter}\n"
-        f"Contact / Candidate: {subject}\n\n"
+        f"Candidate: {subject}\n"
+        f"Call Date/Time: {call_timestamp or 'unknown'}\n\n"
+
         "EVALUATION TEMPLATE:\n"
         "----------\n"
         f"{template}\n"
         "----------\n\n"
+
         f"{tech_block}"
+
         "CALL TRANSCRIPT:\n"
         "----------\n"
         f"{transcript_text}\n"
         "----------\n\n"
-        "Produce a markdown evaluation that mirrors the template's structure.\n\n"
-        "1. Use the template's section headers verbatim as ## headings in your "
-        "output (e.g. ## Work Status, ## Rate, ## Logistics).\n\n"
-        "2. For each point or question listed under a section, output a bullet "
-        "that includes ALL of the following:\n"
-        "   - The template point (the question or topic).\n"
-        "   - Status: **Covered**, **Partially Covered**, or **Missed**.\n"
-        "   - **The candidate's exact verbatim response from the transcript, in "
-        "quotes**, when status is Covered or Partially Covered. Copy what the "
-        "candidate said word-for-word — do not paraphrase, summarize, or clean "
-        "up filler. If the candidate gave a long response, use a representative "
-        "verbatim sentence or two, then 'continues...' if more was said. If the "
-        "recruiter asked the question but the candidate gave no substantive "
-        "answer, note that. If status is Missed, no quote is needed.\n\n"
-        "Example bullet format for a Covered item:\n"
-        "   - **Why looking to move?** — **Covered**: \"I've been at my current "
-        "place for four years and I'm just not learning anything new. The team "
-        "is small and there's no path up.\"\n\n"
-        "3. If the template has an 'OOPS Section' (or similar 'missed items' "
-        "section), populate it by listing every point you marked **Missed** above. "
-        "If nothing was missed, write '_All required points were covered._'\n\n"
-        "4. If the template has a section asking you to list technical screening "
-        "questions, coaching notes, or any other free-form addition not in the "
-        "main template, fill those in based on what you observe in the transcript. "
-        "Include verbatim quotes there as well.\n\n"
-        "5. If the template is clearly a placeholder (e.g. it says PLACEHOLDER), "
-        "evaluate against the suggested points it lists using three sections: "
-        "## Covered Well, ## Not Covered Well Enough, ## Missed, still including "
-        "verbatim quotes where applicable. Then add a note that the template is "
-        "a placeholder and should be replaced with the real one.\n\n"
-        "6. Do NOT append any additional wrap-up sections (no Summary, no "
-        "Coaching Note, no Overall Assessment, no closing paragraph). The "
-        "template's own sections are the entire output. Stop after the last "
-        "section the template defines.\n\n"
-        "Be honest but constructive. Quote accurately."
+
+        "Produce a candidate information note in markdown following this format.\n\n"
+
+        "HEADER (top of the note):\n"
+        f"# Interview with {subject}\n"
+        f"**Recruiter:** {recruiter}\n"
+        f"**Date:** {call_timestamp or 'unknown'}\n\n"
+
+        "SECTIONS — for each section of the EVALUATION TEMPLATE above:\n"
+        "1. Use the template's section name verbatim as a `## section heading`.\n"
+        "2. For each question/topic in the section, output a bullet that begins "
+        "with the question text, then the candidate's response in clean, "
+        "factual prose based on what they actually said in the transcript.\n"
+        "3. Write the response as informative prose — NOT verbatim quotes in "
+        "quotation marks. Capture every specific fact: names, numbers, dates, "
+        "locations, dollar amounts, durations, company names, technologies. "
+        "Use semicolons to separate distinct facts in a single bullet when needed.\n"
+        "4. If a question was not asked, OR the candidate did not give a "
+        "substantive answer, write `Not discussed.` after the bullet.\n"
+        "5. Do NOT include 'Covered' / 'Partially Covered' / 'Missed' labels. "
+        "This is a candidate information document, not a coaching report.\n"
+        "6. Do NOT add commentary about the recruiter's performance or technique.\n\n"
+
+        "TECHNICAL SCREENING QUESTIONS section (special rules):\n"
+        "- Number each technical question as `1.`, `2.`, `3.`, etc.\n"
+        "- Provide the candidate's COMPLETE answer for every technical "
+        "question — do not truncate, abbreviate, or drop details. "
+        "Long, multi-fact answers are expected and welcome. This section "
+        "is the recruiter's definitive record of the candidate's technical "
+        "depth and will be read by hiring managers.\n"
+        "- If a specific technical question was not asked, write "
+        "`Not discussed.` below it.\n\n"
+
+        "OOPS SECTION (if the template has one):\n"
+        "List every question or topic from the previous sections that was "
+        "answered `Not discussed.` or otherwise not substantively covered. "
+        "One bullet per item, just the question/topic. No commentary.\n\n"
+
+        "FINAL RULES:\n"
+        "- Use markdown formatting throughout (headings, bullets, bold).\n"
+        "- Stop after the last template section. Do NOT append a wrap-up "
+        "Summary, Coaching Note, Overall Assessment, or closing paragraph.\n"
+        "- Be factual and direct — this is reference material that goes "
+        "into the candidate's ATS record.\n"
     )
 
     client = get_openai_client()
