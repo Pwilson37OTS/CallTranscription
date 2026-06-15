@@ -291,6 +291,38 @@ def delete_expired_cloudcall_recordings(retention_hours: int = 48) -> int:
         conn.close()
 
 
+def get_ingestion_statuses_for_call_ids(call_data_ids) -> Dict[str, Dict[str, Any]]:
+    """Look up the ingestion status in ECHO for a batch of CloudCall call IDs.
+
+    Returns a dict mapping cloudcall_recording_id -> {"status": ..., "error_message": ...}.
+    Calls not present in the DB are absent from the result. Used by the
+    admin Call Inspector to annotate CloudCall's raw data with what ECHO
+    actually has, so admins can see at a glance which calls fell through
+    ingestion.
+    """
+    call_data_ids = list(call_data_ids or [])
+    if not call_data_ids:
+        return {}
+    conn = get_conn()
+    try:
+        placeholders = ",".join("?" for _ in call_data_ids)
+        rows = conn.execute(
+            f"SELECT cloudcall_recording_id, status, error_message "
+            f"FROM cloudcall_recordings "
+            f"WHERE cloudcall_recording_id IN ({placeholders})",
+            tuple(call_data_ids),
+        ).fetchall()
+        return {
+            r["cloudcall_recording_id"]: {
+                "status": r["status"],
+                "error_message": r["error_message"] or "",
+            }
+            for r in rows
+        }
+    finally:
+        conn.close()
+
+
 def get_unmapped_cloudcall_user_ids() -> List[str]:
     """Get distinct CloudCall user IDs from recordings that have no user mapping."""
     conn = get_conn()

@@ -504,6 +504,154 @@ def get_storage_breakdown() -> list:
     return items
 
 
+def try_ingest_calls(calls: list) -> list:
+    """Attempt to ingest a list of CloudCall call dicts. Reports per-call result.
+
+    Used by the admin Call Inspector to forensically retry specific calls
+    that didn't make it through the regular poll. Surfaces the exact reason
+    each call failed (URL-fetch exception, no_audio, insert error, etc.)
+    so admins can diagnose CloudCall-side issues directly.
+
+    Each call dict should be a raw entry as returned by fetch_call_logs /
+    inspect_call_logs. Returns a list of result dicts: { call_data_id,
+    user_name, contact_name, success, status, message }.
+    """
+    from cloudcall_db import (
+        insert_cloudcall_recording,
+        get_cloudcall_user_mapping,
+        get_conn as _cc_get_conn,
+    )
+
+    # Pull the known-IDs set once so we can short-circuit duplicates fast.
+    cc_conn = _cc_get_conn()
+    try:
+        known_ids = {
+            r["cloudcall_recording_id"]
+            for r in cc_conn.execute(
+                "SELECT cloudcall_recording_id FROM cloudcall_recordings"
+            ).fetchall()
+        }
+    finally:
+        cc_conn.close()
+
+    results = []
+    now = datetime.utcnow()
+
+    for call in calls:
+        call_data_id = call.get("user_call_data_id", "")
+        result = {
+            "call_data_id": call_data_id,
+            "user_name": call.get("user_name", ""),
+            "contact_name": call.get("contact_name", ""),
+            "duration": call.get("duration", 0),
+            "success": False,
+            "status": "",
+            "message": "",
+        }
+
+        if not call_data_id:
+            result["status"] = "skipped_no_call_id"
+            result["message"] = "Call has no user_call_data_id"
+            results.append(result)
+            continue
+
+        if call_data_id in known_ids:
+            result["status"] = "already_known"
+            result["message"] = "Already in DB — use Re-validate Stored Recordings if status looks wrong"
+            results.append(result)
+            continue
+
+        # Fetch URL — this is the step that usually fails for the 'missing'
+        # cases. Capture the exact exception so the admin can see it.
+        rec_url = None
+        url_error = None
+        try:
+            rec_url = get_recording_url(call_data_id)
+        except Exception as e:
+            url_error = str(e)
+
+        if url_error:
+            result["status"] = "url_fetch_error"
+            result["message"] = f"get_recording_url raised: {url_error}"
+            results.append(result)
+            continue
+
+        if rec_url:
+            record_status = "available"
+            url_to_store = rec_url
+        else:
+            record_status = "no_audio"
+            url_to_store = ""
+
+        # Resolve user mapping
+        cloudcall_user_id = call.get("cloudcall_user_id", "")
+        app_user_id = None
+        if cloudcall_user_id:
+            mapping = get_cloudcall_user_mapping(cloudcall_user_id)
+            if not mapping:
+                email = call.get("email", "")
+                if email:
+                    mapping = get_cloudcall_user_mapping(email)
+            if mapping:
+                app_user_id = mapping["app_user_id"]
+
+        # Insert
+        recording_db_id = None
+        try:
+            recording_db_id = insert_cloudcall_recording({
+                "cloudcall_recording_id": call_data_id,
+                "cloudcall_user_id": cloudcall_user_id,
+                "app_user_id": app_user_id,
+                "recording_url": url_to_store,
+                "recruiter_name": call.get("user_name", ""),
+                "contact_name": call.get("contact_name", ""),
+                "caller_number": call.get("user_number", ""),
+                "callee_number": call.get("contact_number", ""),
+                "direction": call.get("direction", ""),
+                "call_duration_seconds": call.get("duration"),
+                "call_timestamp": call.get("created_on", now.isoformat()),
+                "status": record_status,
+                "webhook_received_at": now.isoformat(),
+                "webhook_payload": "",
+            })
+            result["status"] = record_status
+            result["message"] = f"Inserted with status={record_status}"
+            result["success"] = True
+        except Exception as e:
+            if "UNIQUE constraint" in str(e):
+                result["status"] = "already_known"
+                result["message"] = "Race condition — already inserted by another process"
+            else:
+                result["status"] = "insert_error"
+                result["message"] = f"Insert failed: {e}"
+            results.append(result)
+            continue
+
+        # Try auto-import for mapped + available recordings
+        if record_status == "available" and app_user_id and recording_db_id:
+            try:
+                contact_label = (
+                    call.get("contact_name") or call.get("contact_number") or ""
+                ).strip()
+                new_call_id = import_recording_to_pipeline(
+                    cloudcall_recording_db_id=recording_db_id,
+                    user_id=app_user_id,
+                    metadata={
+                        "recruiter_name": call.get("user_name", ""),
+                        "subject_name": contact_label,
+                    },
+                )
+                result["message"] = f"Inserted and auto-imported as call #{new_call_id}"
+            except Exception as e:
+                result["message"] = (
+                    f"Inserted as {record_status} but auto-import failed: {e}"
+                )
+
+        results.append(result)
+
+    return results
+
+
 def inspect_call_logs(
     from_dt: str,
     to_dt: str,

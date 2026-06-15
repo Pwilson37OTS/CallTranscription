@@ -1042,6 +1042,7 @@ if admin_tab is not None:
                 reimport_unmapped_recordings,
                 revalidate_imported_recordings,
                 inspect_call_logs,
+                try_ingest_calls,
             )
 
             st.markdown("---")
@@ -1185,15 +1186,45 @@ if admin_tab is not None:
                     st.write(f"**{len(ins_calls)}** call(s) returned by CloudCall in this window.")
 
                     if ins_calls:
+                        # Annotate each CloudCall row with ECHO's current
+                        # ingestion status — the most useful diagnostic.
+                        # Calls not in ECHO's DB show NOT IN DB.
+                        from cloudcall_db import get_ingestion_statuses_for_call_ids
+                        echo_statuses = get_ingestion_statuses_for_call_ids(
+                            [c.get("user_call_data_id", "") for c in ins_calls]
+                        )
+                        for c in ins_calls:
+                            cid = c.get("user_call_data_id", "")
+                            row_status = echo_statuses.get(cid)
+                            if row_status is None:
+                                c["echo_status"] = "NOT IN DB"
+                                c["echo_error"] = ""
+                            else:
+                                c["echo_status"] = row_status["status"]
+                                c["echo_error"] = row_status.get("error_message", "")
+
+                        missing_count = sum(1 for c in ins_calls if c.get("echo_status") == "NOT IN DB")
+                        if missing_count:
+                            st.warning(
+                                f"**{missing_count} call(s) above are NOT IN ECHO's DB.** "
+                                "Use the Try Ingest button below to retry them and see "
+                                "the exact reason each one is failing (URL fetch error, "
+                                "no_audio, etc.)."
+                            )
+
+                        # Persist for the action button below the form.
+                        st.session_state["_inspector_last_calls"] = ins_calls
+
                         # Build a wide table showing every field returned.
                         # The columns differ across calls (some entries may
                         # have extra fields), so we let pandas widen to the
                         # union of all keys.
                         import pandas as _pd_ins
                         df_ins = _pd_ins.DataFrame(ins_calls)
-                        # Move the most-useful diagnostic columns up front
-                        # when they're present.
+                        # Diagnostic columns up front: ECHO status first,
+                        # then the CloudCall fields most useful for forensics.
                         preferred_order = [
+                            "echo_status", "echo_error",
                             "user_call_data_id", "created_on", "user_name",
                             "user_number", "contact_name", "contact_number",
                             "direction", "duration", "recording_duration",
@@ -1214,6 +1245,41 @@ if admin_tab is not None:
                 except Exception as e:
                     logger.error("Call inspector failed: user_id=%d error=%s", current_user_id, e)
                     st.error(f"Inspector failed: {e}")
+
+            # --- Try Ingest Missing Calls button (outside the form so it
+            # doesn't get cleared on each re-render). Uses the most recent
+            # inspector results stashed in session_state.
+            _last_calls = st.session_state.get("_inspector_last_calls", [])
+            _missing_calls = [c for c in _last_calls if c.get("echo_status") == "NOT IN DB"]
+            if _missing_calls:
+                if st.button(
+                    f"Try Ingest {len(_missing_calls)} Missing Call(s)",
+                    key="try_ingest_missing_btn",
+                    help="Run the ingest logic on every call shown above with status NOT IN DB. Reports the exact outcome (success, URL-fetch error, etc.) per call.",
+                ):
+                    try:
+                        with st.spinner(f"Trying to ingest {len(_missing_calls)} call(s)..."):
+                            results = try_ingest_calls(_missing_calls)
+                        st.markdown("#### Ingest Results")
+                        for r in results:
+                            label = (
+                                f"**{r['user_name'] or '—'} / {r['contact_name'] or '—'}** "
+                                f"(`{r['call_data_id']}`, {r['duration']}s)"
+                            )
+                            if r["success"]:
+                                st.success(f"✓ {label} — {r['message']}")
+                            elif r["status"] == "already_known":
+                                st.info(f"• {label} — {r['message']}")
+                            else:
+                                st.error(f"✗ {label} — `{r['status']}`: {r['message']}")
+                        logger.info(
+                            "Admin try-ingest: user_id=%d attempted=%d results=%s",
+                            current_user_id, len(_missing_calls),
+                            [{"id": r["call_data_id"], "status": r["status"]} for r in results],
+                        )
+                    except Exception as e:
+                        logger.error("Try-ingest failed: user_id=%d error=%s", current_user_id, e)
+                        st.error(f"Try Ingest failed: {e}")
 
         # --- CloudCall User Mappings ---
         if CLOUDCALL_ENABLED:
