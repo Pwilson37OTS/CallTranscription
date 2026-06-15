@@ -1041,6 +1041,7 @@ if admin_tab is not None:
                 get_cloudcall_ingest_stats,
                 reimport_unmapped_recordings,
                 revalidate_imported_recordings,
+                inspect_call_logs,
             )
 
             st.markdown("---")
@@ -1123,6 +1124,96 @@ if admin_tab is not None:
                 except Exception as e:
                     logger.error("Re-validate failed: user_id=%d error=%s", current_user_id, e)
                     st.error(f"Re-validate failed: {e}")
+
+            # --- CloudCall Call Inspector (raw API diagnostic) ---
+            st.markdown("---")
+            st.markdown("### CloudCall Call Inspector")
+            st.caption(
+                "Pulls raw `call_logs` data directly from CloudCall's API "
+                "without ingesting anything. Use this to investigate why a "
+                "specific call looks different in ECHO than in CloudCall "
+                "(e.g., 1 long call appearing as multiple short ones). "
+                "All available fields per call are shown so you can spot "
+                "split sessions, transfers, or anomalous durations."
+            )
+
+            from datetime import timedelta as _td
+            # Default to the last 24 hours, UTC. Admin can adjust the
+            # date and time pickers to investigate any window.
+            _now_utc = datetime.utcnow()
+            _yesterday_utc = _now_utc - _td(hours=24)
+
+            with st.form("cc_inspector_form"):
+                ins_cols = st.columns(2)
+                with ins_cols[0]:
+                    ins_from_date = st.date_input("From date (UTC)", value=_yesterday_utc.date(), key="ins_from_date")
+                    ins_from_time = st.time_input("From time (UTC)", value=_yesterday_utc.time().replace(microsecond=0), key="ins_from_time")
+                with ins_cols[1]:
+                    ins_to_date = st.date_input("To date (UTC)", value=_now_utc.date(), key="ins_to_date")
+                    ins_to_time = st.time_input("To time (UTC)", value=_now_utc.time().replace(microsecond=0), key="ins_to_time")
+
+                ins_recruiter_filter = st.text_input(
+                    "Filter by recruiter name (substring match, optional)",
+                    placeholder="e.g. Gracie",
+                    key="ins_recruiter",
+                )
+                ins_include_unrecorded = st.checkbox(
+                    "Include calls not marked as recorded (drops the is_recorded=1 filter)",
+                    key="ins_unrecorded",
+                )
+
+                ins_submitted = st.form_submit_button("Inspect CloudCall")
+
+            if ins_submitted:
+                try:
+                    from_iso = datetime.combine(ins_from_date, ins_from_time).strftime("%Y-%m-%dT%H:%M:%S")
+                    to_iso = datetime.combine(ins_to_date, ins_to_time).strftime("%Y-%m-%dT%H:%M:%S")
+
+                    with st.spinner(f"Fetching call_logs from CloudCall ({from_iso} → {to_iso})..."):
+                        ins_calls = inspect_call_logs(
+                            from_iso, to_iso,
+                            include_unrecorded=ins_include_unrecorded,
+                        )
+
+                    if ins_recruiter_filter:
+                        flt = ins_recruiter_filter.lower().strip()
+                        ins_calls = [
+                            c for c in ins_calls
+                            if flt in (c.get("user_name", "") or "").lower()
+                        ]
+
+                    st.write(f"**{len(ins_calls)}** call(s) returned by CloudCall in this window.")
+
+                    if ins_calls:
+                        # Build a wide table showing every field returned.
+                        # The columns differ across calls (some entries may
+                        # have extra fields), so we let pandas widen to the
+                        # union of all keys.
+                        import pandas as _pd_ins
+                        df_ins = _pd_ins.DataFrame(ins_calls)
+                        # Move the most-useful diagnostic columns up front
+                        # when they're present.
+                        preferred_order = [
+                            "user_call_data_id", "created_on", "user_name",
+                            "user_number", "contact_name", "contact_number",
+                            "direction", "duration", "recording_duration",
+                            "is_recorded", "cloudcall_user_id",
+                        ]
+                        ordered = [c for c in preferred_order if c in df_ins.columns]
+                        ordered += [c for c in df_ins.columns if c not in ordered]
+                        df_ins = df_ins[ordered]
+                        st.dataframe(df_ins, use_container_width=True, hide_index=True)
+
+                        with st.expander("Show raw JSON (every field returned by CloudCall)"):
+                            st.json(ins_calls)
+                    logger.info(
+                        "Admin call inspector: user_id=%d from=%s to=%s include_unrecorded=%s recruiter_filter=%r returned=%d",
+                        current_user_id, from_iso, to_iso, ins_include_unrecorded,
+                        ins_recruiter_filter, len(ins_calls),
+                    )
+                except Exception as e:
+                    logger.error("Call inspector failed: user_id=%d error=%s", current_user_id, e)
+                    st.error(f"Inspector failed: {e}")
 
         # --- CloudCall User Mappings ---
         if CLOUDCALL_ENABLED:

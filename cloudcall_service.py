@@ -504,6 +504,71 @@ def get_storage_breakdown() -> list:
     return items
 
 
+def inspect_call_logs(
+    from_dt: str,
+    to_dt: str,
+    include_unrecorded: bool = False,
+    rows: int = 100,
+    max_pages: int = 50,
+) -> list:
+    """Fetch raw CloudCall call_logs entries for admin diagnostic inspection.
+
+    Returns the unfiltered list of call dicts CloudCall's API returns so an
+    admin can compare what CloudCall is reporting against what ECHO has
+    actually ingested. Used to investigate cases where one logical call
+    in CloudCall appears as multiple short calls in ECHO (likely caused
+    by CloudCall returning multiple user_call_data_id entries for a single
+    call session — transfers, holds, conference legs, or chunked
+    recordings).
+
+    Args:
+        from_dt, to_dt: ISO datetime strings ("YYYY-MM-DDTHH:MM:SS").
+        include_unrecorded: If True, drop the is_recorded=1 filter so the
+            results show every call CloudCall has in the window, not just
+            ones flagged as recorded.
+        rows: Page size.
+        max_pages: Safety cap (50 pages = 5,000 calls).
+
+    Returns:
+        List of raw call dicts from the API.
+    """
+    all_calls: list = []
+    token = get_access_token()
+
+    base_payload: Dict[str, Any] = {
+        "from": from_dt,
+        "to": to_dt,
+        "order_by": [{"dimension": "created_on", "order": "DESC"}],
+    }
+    if not include_unrecorded:
+        base_payload["filter"] = [
+            {"dimension": "is_recorded", "logical_op": "AND", "values": ["1"]},
+        ]
+
+    with httpx.Client(timeout=30.0) as client:
+        for page in range(1, max_pages + 1):
+            payload = dict(base_payload)
+            payload["pagination"] = {"rows": rows, "pgnum": page}
+            response = client.post(
+                f"{CLOUDCALL_API_BASE_URL}/report/call_logs",
+                headers={"Authorization": f"Bearer {token}"},
+                json=payload,
+            )
+            response.raise_for_status()
+            page_calls = response.json().get("Data", []) or []
+            if not page_calls:
+                break
+            all_calls.extend(page_calls)
+            if len(page_calls) < rows:
+                break
+
+    logger.info(
+        "inspect_call_logs: %d calls between %s and %s (include_unrecorded=%s)",
+        len(all_calls), from_dt, to_dt, include_unrecorded,
+    )
+    return all_calls
+
+
 def revalidate_imported_recordings() -> dict:
     """Audit every status='imported' CloudCall recording for a valid audio file.
 
@@ -905,10 +970,23 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
             inserted += 1
             if record_status == "no_audio":
                 inserted_no_audio += 1
+            # Forensic log: every field that helps explain why a call may
+            # have been split / duplicated by CloudCall. Captures the
+            # per-call identifiers + numbers + both durations + direction.
             logger.info(
-                "Polled recording: %s user=%s (%s) contact=%s duration=%ds status=%s",
-                call_data_id, call.get("user_name", ""), cloudcall_user_id,
-                call.get("contact_name", ""), call.get("duration", 0), record_status,
+                "Polled recording: id=%s user=%s (cc_id=%s) contact=%s "
+                "caller=%s callee=%s call_duration=%ss rec_duration=%ss "
+                "direction=%s status=%s created_on=%s",
+                call_data_id,
+                call.get("user_name", ""), cloudcall_user_id,
+                call.get("contact_name", ""),
+                call.get("user_number", ""),
+                call.get("contact_number", ""),
+                call.get("duration", 0),
+                call.get("recording_duration", 0),
+                call.get("direction", ""),
+                record_status,
+                call.get("created_on", ""),
             )
         except Exception as e:
             if "UNIQUE constraint" in str(e):
