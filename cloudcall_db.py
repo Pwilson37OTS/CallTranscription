@@ -258,6 +258,7 @@ def get_cloudcall_recording(recording_id: int) -> Optional[sqlite3.Row]:
 def update_cloudcall_recording(recording_id: int, **fields) -> None:
     allowed = {
         "status", "imported_call_id", "error_message", "app_user_id",
+        "recording_url",
     }
     if not fields:
         return

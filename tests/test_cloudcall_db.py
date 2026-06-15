@@ -124,9 +124,14 @@ class TestCloudCallRecordings:
         assert rec["imported_call_id"] == call_id
 
     def test_update_disallowed_column(self, cc_db):
+        # cloudcall_recording_id is the table's unique key and must never be
+        # mutable; recording_url is now in the allowed set so pending_url
+        # rows can be updated with the URL once CloudCall finalizes it.
         rec_id = cc_db.insert_cloudcall_recording(_make_recording())
         with pytest.raises(ValueError, match="Disallowed"):
-            cc_db.update_cloudcall_recording(rec_id, recording_url="http://evil.com")
+            cc_db.update_cloudcall_recording(
+                rec_id, cloudcall_recording_id="something-else"
+            )
 
     def test_get_recordings_user_scoped(self, cc_db, sample_user):
         cc_db.insert_cloudcall_recording(_make_recording({"app_user_id": sample_user}))

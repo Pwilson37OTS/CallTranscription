@@ -715,6 +715,12 @@ with log_tab:
                     elif effective_status == "no_audio":
                         st.write("⚠ No Audio")
                         st.caption("CloudCall has no recording file for this call.")
+                    elif effective_status == "pending_url":
+                        st.write("⏳ Pending Audio")
+                        st.caption(
+                            "Waiting for CloudCall to finalize the recording. "
+                            "Auto-retries on every poll."
+                        )
                     elif effective_status == "error":
                         st.write("⚠ Error")
                         if err_msg:
@@ -732,6 +738,8 @@ with log_tab:
                         # caption tells the recruiter exactly why this call
                         # won't appear in the Calls-tab dropdown.
                         st.caption("_Missing recording_")
+                    elif effective_status == "pending_url":
+                        st.caption("_Retrying automatically_")
                     elif effective_status in ("available", "error") and target_user_id is None:
                         st.caption("_Needs mapping_")
                     elif effective_status in ("available", "error"):

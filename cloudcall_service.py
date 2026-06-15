@@ -504,6 +504,140 @@ def get_storage_breakdown() -> list:
     return items
 
 
+def retry_pending_url_recordings(age_out_hours: int = 24) -> dict:
+    """Retry the URL fetch for every cloudcall_recordings row stuck at
+    status='pending_url' (calls whose URL wasn't available at first poll).
+
+    For each pending row:
+      - If get_recording_url now returns a URL: update status to 'available',
+        store the URL, and trigger auto-import if a user mapping exists.
+      - If get_recording_url returns cleanly with no URL: CloudCall confirmed
+        no audio file, transition to 'no_audio'.
+      - If get_recording_url still throws AND the row is older than
+        age_out_hours: give up, transition to 'no_audio' with a clear
+        error message.
+      - Otherwise: leave at pending_url for the next poll.
+
+    Called at the start of every poll_recent_recordings() pass so that
+    long-finalizing recordings (long calls, transient CloudCall errors,
+    etc.) get retried indefinitely rather than silently dropped after
+    the auto-poll's lookback window slides past them.
+
+    Returns counts: retried, succeeded, aged_out, still_pending.
+    """
+    from cloudcall_db import (
+        get_conn as _cc_get_conn,
+        update_cloudcall_recording,
+    )
+
+    cc_conn = _cc_get_conn()
+    try:
+        rows = cc_conn.execute(
+            "SELECT * FROM cloudcall_recordings WHERE status = 'pending_url'"
+        ).fetchall()
+    finally:
+        cc_conn.close()
+
+    if not rows:
+        return {"retried": 0, "succeeded": 0, "aged_out": 0, "still_pending": 0}
+
+    retried = 0
+    succeeded = 0
+    aged_out = 0
+    still_pending = 0
+    now = datetime.utcnow()
+    age_out_seconds = age_out_hours * 3600
+
+    for row in rows:
+        retried += 1
+        rec_id = row["id"]
+        cc_recording_id = row["cloudcall_recording_id"]
+
+        rec_url = None
+        url_error = None
+        try:
+            rec_url = get_recording_url(cc_recording_id)
+        except Exception as e:
+            url_error = str(e)
+
+        if rec_url:
+            # Success — CloudCall now has the URL ready.
+            update_cloudcall_recording(
+                rec_id,
+                status="available",
+                recording_url=rec_url,
+                error_message="",
+            )
+            succeeded += 1
+            logger.info(
+                "Pending URL retry succeeded: rec_id=%d cc_id=%s",
+                rec_id, cc_recording_id,
+            )
+
+            # Auto-import if the recording is mapped to an app user.
+            if row["app_user_id"]:
+                try:
+                    contact_label = (
+                        row["contact_name"] or row["callee_number"] or ""
+                    ).strip()
+                    import_recording_to_pipeline(
+                        cloudcall_recording_db_id=rec_id,
+                        user_id=row["app_user_id"],
+                        metadata={
+                            "recruiter_name": row["recruiter_name"] or "",
+                            "subject_name": contact_label,
+                        },
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "Auto-import failed after pending_url retry (rec_id=%d): %s",
+                        rec_id, e,
+                    )
+            continue
+
+        if url_error is None:
+            # Clean 200 response from CloudCall with no URL in the body.
+            # That's their definitive "no audio file" signal for this call.
+            update_cloudcall_recording(
+                rec_id,
+                status="no_audio",
+                error_message="CloudCall returned no recording URL on retry",
+            )
+            aged_out += 1
+            continue
+
+        # URL fetch threw — check age and decide whether to keep waiting.
+        try:
+            received_at = datetime.fromisoformat(row["webhook_received_at"])
+            age_secs = (now - received_at).total_seconds()
+        except Exception:
+            age_secs = 0
+
+        if age_secs > age_out_seconds:
+            update_cloudcall_recording(
+                rec_id,
+                status="no_audio",
+                error_message=(
+                    f"URL never became available after {age_out_hours}h. "
+                    f"Last attempt: {url_error[:200]}"
+                ),
+            )
+            aged_out += 1
+        else:
+            still_pending += 1
+
+    logger.info(
+        "Pending URL retry pass: %d processed (%d succeeded, %d aged out to no_audio, %d still pending)",
+        retried, succeeded, aged_out, still_pending,
+    )
+    return {
+        "retried": retried,
+        "succeeded": succeeded,
+        "aged_out": aged_out,
+        "still_pending": still_pending,
+    }
+
+
 def try_ingest_calls(calls: list) -> list:
     """Attempt to ingest a list of CloudCall call dicts. Reports per-call result.
 
@@ -1000,13 +1134,26 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
         Number of new recordings inserted.
     """
     if lookback_minutes is None:
-        lookback_minutes = CLOUDCALL_POLL_INTERVAL_MINUTES * 2
+        # Minimum 60 minutes so long recordings (which CloudCall takes
+        # several minutes to finalize on their side) get caught on the
+        # regular poll cadence. Combined with pending_url retry below,
+        # calls don't slip through if CloudCall is briefly slow to make
+        # the URL available.
+        lookback_minutes = max(CLOUDCALL_POLL_INTERVAL_MINUTES * 2, 60)
 
     now = datetime.utcnow()
     from_dt = (now - __import__("datetime").timedelta(minutes=lookback_minutes)).strftime("%Y-%m-%dT%H:%M:%S")
     to_dt = now.strftime("%Y-%m-%dT%H:%M:%S")
 
     logger.info("Polling CloudCall call logs from %s to %s", from_dt, to_dt)
+
+    # First, retry any rows stuck at status='pending_url' from prior polls.
+    # These are calls where CloudCall returned an error or an empty URL
+    # when we first saw them. Once CloudCall finalizes the recording on
+    # their side, the retry succeeds and the row transitions to 'available'
+    # + auto-imports. Rows that stay broken for >24h transition to
+    # 'no_audio' so they don't linger as pending forever.
+    retry_stats = retry_pending_url_recordings()
 
     try:
         calls = fetch_call_logs(from_dt, to_dt)
@@ -1015,7 +1162,10 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
         raise
 
     if not calls:
-        logger.info("No recorded calls found in polling window")
+        logger.info(
+            "No recorded calls found in polling window (pending_url retries: %s)",
+            retry_stats,
+        )
         return 0
 
     # Pre-fetch every cloudcall_recording_id we already have so we can
@@ -1061,9 +1211,55 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
         # Fetch recording URL
         try:
             rec_url = get_recording_url(call_data_id)
+            url_fetch_error_str = None
         except Exception as e:
-            logger.warning("Failed to get recording URL for %s: %s", call_data_id, e)
+            logger.warning(
+                "Failed to get recording URL for %s: %s — inserting as pending_url for retry",
+                call_data_id, e,
+            )
             url_fetch_failed += 1
+            rec_url = None
+            url_fetch_error_str = str(e)
+
+        # If the URL fetch raised an exception (not a clean empty response),
+        # insert the row at status='pending_url' so retry_pending_url_recordings()
+        # picks it up on subsequent polls. Don't skip silently — that's how
+        # calls were getting lost when CloudCall took >10 min to finalize
+        # the recording.
+        if url_fetch_error_str is not None:
+            cloudcall_user_id_pu = call.get("cloudcall_user_id", "")
+            app_user_id_pu = None
+            if cloudcall_user_id_pu:
+                m = get_cloudcall_user_mapping(cloudcall_user_id_pu)
+                if not m:
+                    em = call.get("email", "")
+                    if em:
+                        m = get_cloudcall_user_mapping(em)
+                if m:
+                    app_user_id_pu = m["app_user_id"]
+            try:
+                insert_cloudcall_recording({
+                    "cloudcall_recording_id": call_data_id,
+                    "cloudcall_user_id": cloudcall_user_id_pu,
+                    "app_user_id": app_user_id_pu,
+                    "recording_url": "",
+                    "recruiter_name": call.get("user_name", ""),
+                    "contact_name": call.get("contact_name", ""),
+                    "caller_number": call.get("user_number", ""),
+                    "callee_number": call.get("contact_number", ""),
+                    "direction": call.get("direction", ""),
+                    "call_duration_seconds": call.get("duration"),
+                    "call_timestamp": call.get("created_on", now.isoformat()),
+                    "status": "pending_url",
+                    "webhook_received_at": now.isoformat(),
+                    "webhook_payload": "",
+                })
+            except Exception as insert_err:
+                if "UNIQUE constraint" not in str(insert_err):
+                    logger.error(
+                        "Failed to insert pending_url row for %s: %s",
+                        call_data_id, insert_err,
+                    )
             continue
 
         # CloudCall sometimes flags a call as is_recorded=1 but its audio
@@ -1174,9 +1370,10 @@ def poll_recent_recordings(lookback_minutes: int = None) -> int:
     logger.info(
         "Polling complete: %d total calls from CloudCall | %d inserted with audio | "
         "%d inserted as no_audio | %d already known (skipped) | "
-        "%d had no call_data_id (skipped) | %d had URL fetch errors (skipped)",
+        "%d had no call_data_id (skipped) | %d URL fetch errors (queued as pending_url for retry) | "
+        "pending_url retry stats: %s",
         len(calls), inserted_with_audio, inserted_no_audio, skipped_known,
-        skipped_no_call_id, url_fetch_failed,
+        skipped_no_call_id, url_fetch_failed, retry_stats,
     )
 
     # Opportunistic cleanup
