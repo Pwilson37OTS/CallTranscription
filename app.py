@@ -117,7 +117,9 @@ user_is_manager = is_manager()
 
 
 def _scoped_user_ids():
-    """Return the user-id scope for the current viewer.
+    """Team-scoped user-id list. Used for team management features
+    (User Management, API Usage analytics, CloudCall mappings) where
+    Managers should still see only their assigned team.
 
     - Admin: None (see everything).
     - Manager: list of active user IDs in their team (their own ID included).
@@ -133,8 +135,22 @@ def _scoped_user_ids():
     return [current_user_id]
 
 
+def _calls_scoped_user_ids():
+    """Call-visibility scope. Wider than team scope: Managers see ALL
+    recruiters' calls so they can cover when other managers are out.
+
+    - Admin: None (all calls).
+    - Manager: None (all calls — same as admin for call visibility).
+    - Recruiter: [current_user_id] (own calls only).
+    """
+    if user_is_admin or user_is_manager:
+        return None
+    return [current_user_id]
+
+
 # Cache once per render — get_team_member_ids hits the DB.
 scoped_user_ids = _scoped_user_ids()
+calls_scoped_user_ids = _calls_scoped_user_ids()
 
 
 # -----------------------------
@@ -260,7 +276,7 @@ admin_tab = tabs[2] if (user_is_admin or user_is_manager) else None
 with calls_tab:
     st.subheader("Process a Call")
 
-    calls = get_all_calls(user_ids=scoped_user_ids)
+    calls = get_all_calls(user_ids=calls_scoped_user_ids)
 
     if not calls:
         if CLOUDCALL_ENABLED:
@@ -320,15 +336,44 @@ with calls_tab:
             key="active_call_type",
         )
 
-        # === Step 2: Select a Call dropdown ===
+        # === Step 2: Select a Recruiter filter (admin/manager only) ===
+        # Lets admins and managers narrow the Select-a-Call dropdown to a
+        # single recruiter's calls. Recruiters skip this step since they
+        # only see their own calls anyway.
+        recruiter_filter_user_id = None
+        if user_is_admin or user_is_manager:
+            all_users_for_filter = get_all_users()
+            recruiter_filter_options = {"(All recruiters)": None}
+            for u in sorted(
+                [u for u in all_users_for_filter if u["is_active"]],
+                key=lambda x: (x["display_name"] or "").lower(),
+            ):
+                label = f"{u['display_name']} ({u['email']})"
+                recruiter_filter_options[label] = u["id"]
+            selected_recruiter_label = st.selectbox(
+                "Select a recruiter (filter)",
+                list(recruiter_filter_options.keys()),
+                key="active_recruiter_filter",
+                help="Narrow the Select-a-Call dropdown to one recruiter's calls.",
+            )
+            recruiter_filter_user_id = recruiter_filter_options[selected_recruiter_label]
+
+            if recruiter_filter_user_id is not None:
+                calls = [c for c in calls if c["user_id"] == recruiter_filter_user_id]
+                if not calls:
+                    st.info("This recruiter has no calls in the system yet.")
+
+        # === Step 3: Select a Call dropdown ===
         options = {_call_label(row): row["id"] for row in calls}
-        selected_label = st.selectbox(
-            "Select a call",
-            list(options.keys()),
-            key="active_call_selection",
-        )
-        selected_id = options[selected_label]
-        call = get_call(selected_id, user_ids=scoped_user_ids)
+        call = None
+        if options:
+            selected_label = st.selectbox(
+                "Select a call",
+                list(options.keys()),
+                key="active_call_selection",
+            )
+            selected_id = options[selected_label]
+            call = get_call(selected_id, user_ids=calls_scoped_user_ids)
 
         if call:
             # Auto-transcribe up front so all downstream state — especially
@@ -340,7 +385,7 @@ with calls_tab:
                 transcript_text = ensure_transcript(call)
                 # Refresh `call` to pick up the new transcript_text the helper
                 # just wrote to the DB.
-                call = get_call(call["id"], user_ids=scoped_user_ids)
+                call = get_call(call["id"], user_ids=calls_scoped_user_ids)
             except Exception as e:
                 transcript_error = str(e)
                 logger.error(
@@ -594,11 +639,8 @@ with log_tab:
     else:
         st.subheader("Call Log")
 
-    if user_is_admin:
-        log_scope_note = "Admin view — showing calls across all users."
-    elif user_is_manager:
-        team_label = current_user_team or "your team"
-        log_scope_note = f"Manager view — showing calls for **{team_label}** members."
+    if user_is_admin or user_is_manager:
+        log_scope_note = "Showing calls across all recruiters."
     else:
         log_scope_note = "Showing only calls associated with your CloudCall account."
     st.caption(f"CloudCall recordings from the last {_RET_LABEL}. " + log_scope_note)
@@ -613,11 +655,10 @@ with log_tab:
         _CT = _ZoneInfo("America/Chicago")
         _UTC = _ZoneInfo("UTC")
 
-        # Admins see every recording; managers see their team's; recruiters
-        # see only their own. Filtering is by app_user_id set when the poller
-        # matched a CloudCall user mapping. Recordings without a mapping are
-        # invisible to non-admins by design.
-        recordings = _get_cc_recs(user_ids=scoped_user_ids, hours=_RET_HOURS)
+        # Admins and managers see every recording across all recruiters.
+        # Regular recruiters see only their own (filtered via app_user_id
+        # set when the poller matched a CloudCall user mapping).
+        recordings = _get_cc_recs(user_ids=calls_scoped_user_ids, hours=_RET_HOURS)
 
         if not recordings:
             st.info(f"No CloudCall recordings in the last {_RET_LABEL}.")
@@ -638,6 +679,79 @@ with log_tab:
                 m = rem // 60
                 return f"{h}h {m}m"
 
+            # Filter widgets — narrow the table by recruiter, contact
+            # text, direction, or status. Each filter's options come from
+            # the loaded recordings so they only show values present in
+            # the current data. Selections persist across reruns via the
+            # session-state keys.
+            with st.expander("Filters", expanded=False):
+                flt_cols = st.columns(4)
+                with flt_cols[0]:
+                    _recruiter_options = sorted({
+                        (r["recruiter_name"] or "—") for r in recordings
+                    })
+                    _selected_recruiters = st.multiselect(
+                        "Recruiter",
+                        _recruiter_options,
+                        key="cl_filter_recruiter",
+                    )
+                with flt_cols[1]:
+                    _contact_substring = st.text_input(
+                        "Contact contains",
+                        key="cl_filter_contact",
+                        placeholder="Name or phone number",
+                    )
+                with flt_cols[2]:
+                    _direction_options = sorted({
+                        (r["direction"] or "—") for r in recordings
+                    })
+                    _selected_directions = st.multiselect(
+                        "Direction",
+                        _direction_options,
+                        key="cl_filter_direction",
+                    )
+                with flt_cols[3]:
+                    _status_options = sorted({
+                        (r["status"] or "—") for r in recordings
+                    })
+                    _selected_statuses = st.multiselect(
+                        "Status",
+                        _status_options,
+                        key="cl_filter_status",
+                    )
+
+            # Apply filters
+            filtered_recordings = list(recordings)
+            if _selected_recruiters:
+                filtered_recordings = [
+                    r for r in filtered_recordings
+                    if (r["recruiter_name"] or "—") in _selected_recruiters
+                ]
+            if _contact_substring:
+                _cs = _contact_substring.lower()
+                filtered_recordings = [
+                    r for r in filtered_recordings
+                    if _cs in (r["contact_name"] or "").lower()
+                    or _cs in (r["callee_number"] or "").lower()
+                    or _cs in (r["caller_number"] or "").lower()
+                ]
+            if _selected_directions:
+                filtered_recordings = [
+                    r for r in filtered_recordings
+                    if (r["direction"] or "—") in _selected_directions
+                ]
+            if _selected_statuses:
+                filtered_recordings = [
+                    r for r in filtered_recordings
+                    if (r["status"] or "—") in _selected_statuses
+                ]
+
+            if len(filtered_recordings) != len(recordings):
+                st.caption(
+                    f"Showing **{len(filtered_recordings)}** of {len(recordings)} "
+                    "recording(s) after filters."
+                )
+
             # Column layout (must match between header and body rows)
             col_widths = [1.8, 0.8, 1.8, 2.2, 0.9, 1.1, 1.1]
 
@@ -651,7 +765,7 @@ with log_tab:
             hdr[6].markdown("**Import**")
             st.divider()
 
-            for r in recordings:
+            for r in filtered_recordings:
                 row = st.columns(col_widths)
 
                 # Date / time in Central
