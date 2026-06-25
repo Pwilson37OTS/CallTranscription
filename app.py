@@ -37,17 +37,32 @@ if not os.getenv("OPENAI_API_KEY"):
 
 st.markdown(APP_CSS, unsafe_allow_html=True)
 
-# Startup audio-file cleanup. Runs BEFORE init_db() so that if the persistent
-# volume is full, we free space before SQLite tries to write its journal.
-# Best-effort: a failure here must never block app boot.
-try:
-    from cloudcall_service import cleanup_old_files
-    cleanup_old_files()
-except Exception as _e:
-    logger.warning("Startup file cleanup skipped: %s", _e)
+# Startup work that should only happen once per Streamlit server start —
+# NOT on every rerun. Previously this block (cleanup_old_files + init_db
+# + ensure_admin_exists) ran at module top-level, which Streamlit
+# re-executes on every interaction. cleanup_old_files iterates Railway's
+# network-mounted volume calling stat() on every file in 4 directories;
+# that's seconds of per-click latency, and slow enough reruns were
+# dropping the Streamlit WebSocket — kicking users back to the login
+# screen mid-session.
+#
+# Wrapping in @st.cache_resource pins this to one execution per server
+# process. Ongoing file cleanup still runs every 15 min via the poller's
+# maybe_cleanup_expired(), so we're not losing the cleanup behavior —
+# just removing the redundant per-rerun work.
+@st.cache_resource
+def _run_startup_once():
+    init_db()
+    ensure_admin_exists()
+    try:
+        from cloudcall_service import cleanup_old_files
+        cleanup_old_files()
+    except Exception as _e:
+        logger.warning("Startup file cleanup skipped: %s", _e)
+    return True
 
-init_db()
-ensure_admin_exists()
+
+_run_startup_once()
 
 
 # --- Rate limiting (in-memory, per-user, per-hour) ---
