@@ -542,7 +542,15 @@ with calls_tab:
                     # spills onto the page as plain text.
                     import json as _json
                     import streamlit.components.v1 as _components
-                    _payload = _json.dumps(call["summary_text"])
+                    from bullhorn_format import to_html as _bh_html, to_plaintext as _bh_text
+                    # Copy BOTH rich HTML and clean plain text. Bullhorn's note
+                    # editor is rich text and takes the HTML (real headings,
+                    # bold, bullets); plain-text targets get the symbol-free
+                    # fallback. json.dumps gives us safe JS string literals;
+                    # the </ -> <\/ replace keeps a stray "</..." in the
+                    # content from prematurely closing our <script> block.
+                    _html_payload = _json.dumps(_bh_html(call["summary_text"])).replace("</", "<\\/")
+                    _text_payload = _json.dumps(_bh_text(call["summary_text"])).replace("</", "<\\/")
                     _btn_id = f"copyBtn_{call['id']}"
                     _components.html(
                         f"""
@@ -563,7 +571,8 @@ with calls_tab:
                         ">Copy for Bullhorn</button>
                         <script>
                         (function() {{
-                            const payload = {_payload};
+                            const htmlPayload = {_html_payload};
+                            const textPayload = {_text_payload};
                             const btn = document.getElementById("{_btn_id}");
                             const defaultBg = "linear-gradient(135deg, #0D2A39 0%, #36ADEC 100%)";
                             btn.addEventListener("mouseover", function() {{
@@ -572,19 +581,46 @@ with calls_tab:
                             btn.addEventListener("mouseout", function() {{
                                 btn.style.transform = "translateY(0)";
                             }});
+                            function showCopied() {{
+                                const original = btn.innerText;
+                                btn.innerText = "Copied to clipboard";
+                                btn.style.background = "#28a745";
+                                setTimeout(function() {{
+                                    btn.innerText = original;
+                                    btn.style.background = defaultBg;
+                                }}, 1800);
+                            }}
+                            function showFailed(err) {{
+                                btn.innerText = "Copy failed - see console";
+                                console.error(err);
+                            }}
+                            function copyPlain() {{
+                                return navigator.clipboard.writeText(textPayload);
+                            }}
                             btn.addEventListener("click", function() {{
-                                navigator.clipboard.writeText(payload).then(function() {{
-                                    const original = btn.innerText;
-                                    btn.innerText = "Copied to clipboard";
-                                    btn.style.background = "#28a745";
-                                    setTimeout(function() {{
-                                        btn.innerText = original;
-                                        btn.style.background = defaultBg;
-                                    }}, 1800);
-                                }}).catch(function(err) {{
-                                    btn.innerText = "Copy failed - see console";
-                                    console.error(err);
-                                }});
+                                // Preferred path: write rich HTML + plain text
+                                // together so Bullhorn's rich-text note editor
+                                // renders headings/bold/bullets, while plain
+                                // fields still get clean text.
+                                try {{
+                                    if (navigator.clipboard && window.ClipboardItem) {{
+                                        const item = new ClipboardItem({{
+                                            "text/html": new Blob([htmlPayload], {{type: "text/html"}}),
+                                            "text/plain": new Blob([textPayload], {{type: "text/plain"}})
+                                        }});
+                                        navigator.clipboard.write([item])
+                                            .then(showCopied)
+                                            .catch(function() {{
+                                                // Some browsers/permission setups
+                                                // reject rich writes — fall back.
+                                                copyPlain().then(showCopied).catch(showFailed);
+                                            }});
+                                    }} else {{
+                                        copyPlain().then(showCopied).catch(showFailed);
+                                    }}
+                                }} catch (err) {{
+                                    copyPlain().then(showCopied).catch(showFailed);
+                                }}
                             }});
                         }})();
                         </script>
