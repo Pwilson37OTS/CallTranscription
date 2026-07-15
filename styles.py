@@ -46,6 +46,27 @@ APP_CSS = """
   color: var(--brand-navy) !important;
 }
 
+/* Expanders/forms in the sidebar render on a light card, but the blanket
+   white-text rule above makes their labels and header invisible. Restore
+   dark, readable text for that content. */
+[data-testid="stSidebar"] [data-testid="stExpander"] summary,
+[data-testid="stSidebar"] [data-testid="stExpander"] summary p,
+[data-testid="stSidebar"] [data-testid="stForm"] label,
+[data-testid="stSidebar"] [data-testid="stForm"] label p {
+  color: var(--brand-navy) !important;
+}
+
+/* Streamlit form submit buttons aren't matched by the .stButton gradient
+   rule below, so a sidebar submit button ("Update Password") rendered as a
+   pale default button with invisible white text. Give it the brand gradient. */
+[data-testid="stSidebar"] [data-testid="stFormSubmitButton"] > button {
+  background: linear-gradient(135deg, var(--brand-navy) 0%, var(--brand-sky) 100%) !important;
+  color: white !important;
+  border: none !important;
+  border-radius: 12px;
+  font-weight: 600;
+}
+
 [data-testid="stHeader"] {
   background: rgba(255,255,255,0.55);
   backdrop-filter: blur(8px);
