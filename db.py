@@ -32,7 +32,8 @@ def init_db() -> None:
                 role TEXT DEFAULT 'recruiter',
                 is_active INTEGER DEFAULT 1,
                 created_at TEXT NOT NULL,
-                team TEXT
+                team TEXT,
+                must_change_password INTEGER DEFAULT 0
             )
             """
         )
@@ -40,6 +41,13 @@ def init_db() -> None:
         # Managers are scoped to a team — their team is what they manage.
         try:
             conn.execute("ALTER TABLE users ADD COLUMN team TEXT")
+        except sqlite3.OperationalError:
+            pass  # column already exists
+        # Idempotent migration for installs created before forced password
+        # change existed. Existing users default to 0 (not forced); newly
+        # created users and admin-reset users get 1 (see app.py).
+        try:
+            conn.execute("ALTER TABLE users ADD COLUMN must_change_password INTEGER DEFAULT 0")
         except sqlite3.OperationalError:
             pass  # column already exists
         conn.execute(
@@ -158,7 +166,7 @@ def get_all_users() -> List[sqlite3.Row]:
 
 
 def update_user(user_id: int, **fields) -> None:
-    allowed = {"display_name", "role", "is_active", "password_hash", "team"}
+    allowed = {"display_name", "role", "is_active", "password_hash", "team", "must_change_password"}
     if not fields:
         return
     invalid = set(fields.keys()) - allowed

@@ -132,6 +132,32 @@ class TestSessionHelpers:
         assert mock_st.session_state["user_role"] == "admin"
 
     @patch("auth.st")
+    def test_login_sets_must_change_password_flag(self, mock_st):
+        mock_st.session_state = {}
+        from auth import login
+
+        login({"id": 1, "email": "a@b.com", "display_name": "A", "role": "recruiter",
+                "team": None, "must_change_password": 1})
+        assert mock_st.session_state["must_change_password"] is True
+
+    @patch("auth.st")
+    def test_login_defaults_flag_false_when_absent(self, mock_st):
+        mock_st.session_state = {}
+        from auth import login
+
+        # A user dict without the column (e.g. legacy) must not force a change.
+        login({"id": 1, "email": "a@b.com", "display_name": "A", "role": "admin"})
+        assert mock_st.session_state["must_change_password"] is False
+
+    @patch("auth.st")
+    def test_logout_clears_must_change_password(self, mock_st):
+        mock_st.session_state = {"authenticated": True, "must_change_password": True}
+        from auth import logout
+
+        logout()
+        assert "must_change_password" not in mock_st.session_state
+
+    @patch("auth.st")
     def test_logout_clears_session(self, mock_st):
         mock_st.session_state = {
             "authenticated": True,

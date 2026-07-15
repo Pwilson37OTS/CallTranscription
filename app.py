@@ -116,12 +116,73 @@ def show_login_page():
                         logger.warning("Login failed: email=%s", email)
                         st.error("Invalid email or password, or account is deactivated.")
 
+        st.caption(
+            "Forgot your password? Contact your manager or an administrator "
+            "to reset it — for security, passwords can't be looked up, only reset."
+        )
+
+
+# -----------------------------
+# Forced password change (default password, or admin/manager reset)
+# -----------------------------
+def show_force_password_change():
+    """Block the app until the user replaces a default/temporary password.
+
+    Reached when the signed-in user's must_change_password flag is set. The
+    user has already authenticated, so we only ask for the new password (twice)
+    and require it to differ from the one they just used.
+    """
+    from auth import hash_password as _hash_password, verify_password as _verify_password
+    from db import get_user_by_id as _get_user_by_id
+
+    uid = st.session_state["user_id"]
+    col_spacer_l, col_center, col_spacer_r = st.columns([1, 2, 1])
+    with col_center:
+        if LOGO_PATH.exists():
+            st.image(str(LOGO_PATH), width=150)
+        st.markdown("### Set a new password")
+        st.caption(
+            "You're signed in with a default or temporary password. "
+            "Please set your own password to continue."
+        )
+
+        with st.form("force_pw_form"):
+            new_pw = st.text_input("New password", type="password")
+            confirm_pw = st.text_input("Confirm new password", type="password")
+            submitted = st.form_submit_button("Save and continue", use_container_width=True)
+
+            if submitted:
+                current = _get_user_by_id(uid)
+                if not new_pw:
+                    st.error("New password is required.")
+                elif len(new_pw) < 6:
+                    st.error("Password must be at least 6 characters.")
+                elif new_pw != confirm_pw:
+                    st.error("Passwords do not match.")
+                elif current and _verify_password(new_pw, current["password_hash"]):
+                    st.error("Please choose a password different from your current one.")
+                else:
+                    update_user(uid, password_hash=_hash_password(new_pw), must_change_password=0)
+                    st.session_state["must_change_password"] = False
+                    logger.info("Forced password change complete: user_id=%d", uid)
+                    st.success("Password updated.")
+                    st.rerun()
+
+        if st.button("Sign Out", key="force_pw_signout", use_container_width=True):
+            logout()
+            st.rerun()
+
 
 # -----------------------------
 # Auth gate
 # -----------------------------
 if not st.session_state.get("authenticated"):
     show_login_page()
+    st.stop()
+
+# Signed in but still on a default/temporary password — block everything else.
+if st.session_state.get("must_change_password"):
+    show_force_password_change()
     st.stop()
 
 current_user = get_current_user()
@@ -180,6 +241,35 @@ with st.sidebar:
         logger.info("Logout: user_id=%d", current_user_id)
         logout()
         st.rerun()
+
+    with st.expander("Change Password"):
+        from auth import hash_password as _hash_password, verify_password as _verify_password
+        from db import get_user_by_id as _get_user_by_id
+        with st.form("self_change_pw_form"):
+            cur_pw = st.text_input("Current password", type="password")
+            new_pw = st.text_input("New password", type="password")
+            confirm_pw = st.text_input("Confirm new password", type="password")
+            change_submitted = st.form_submit_button("Update Password", use_container_width=True)
+            if change_submitted:
+                me = _get_user_by_id(current_user_id)
+                if not cur_pw or not new_pw:
+                    st.error("All fields are required.")
+                elif not me or not _verify_password(cur_pw, me["password_hash"]):
+                    st.error("Current password is incorrect.")
+                elif len(new_pw) < 6:
+                    st.error("New password must be at least 6 characters.")
+                elif new_pw != confirm_pw:
+                    st.error("New passwords do not match.")
+                elif new_pw == cur_pw:
+                    st.error("New password must be different from the current one.")
+                else:
+                    update_user(
+                        current_user_id,
+                        password_hash=_hash_password(new_pw),
+                        must_change_password=0,
+                    )
+                    logger.info("Self password change: user_id=%d", current_user_id)
+                    st.success("Password updated.")
 
 
 # -----------------------------
@@ -1031,12 +1121,19 @@ if admin_tab is not None:
                             elif new_pw != confirm_pw:
                                 st.error("Passwords do not match.")
                             else:
-                                update_user(u["id"], password_hash=_hash_password(new_pw))
+                                update_user(
+                                    u["id"],
+                                    password_hash=_hash_password(new_pw),
+                                    must_change_password=1,
+                                )
                                 logger.info(
                                     "Admin password reset: target_user_id=%d by user_id=%d",
                                     u["id"], current_user_id,
                                 )
-                                st.success(f"Password reset for {u['email']}.")
+                                st.success(
+                                    f"Password reset for {u['email']}. They'll be prompted "
+                                    "to set their own password at next sign-in."
+                                )
                                 st.session_state[f"_pw_edit_{u['id']}"] = False
                                 st.rerun()
                         elif cancel_pw:
@@ -1126,11 +1223,17 @@ if admin_tab is not None:
                     st.error("You don't have a team assigned. Ask an admin to set one before creating users.")
                 else:
                     try:
-                        create_user(
+                        new_user_id = create_user(
                             new_email, new_name, new_password,
                             role=new_role, team=effective_team,
                         )
-                        st.success(f"User {new_email} created.")
+                        # New accounts start on a shared/known password, so
+                        # require the user to set their own at first sign-in.
+                        update_user(new_user_id, must_change_password=1)
+                        st.success(
+                            f"User {new_email} created. They'll set their own "
+                            "password at first sign-in."
+                        )
                         st.rerun()
                     except Exception as e:
                         if "UNIQUE constraint" in str(e):

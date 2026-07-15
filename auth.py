@@ -54,11 +54,18 @@ def login(user: Dict[str, Any]) -> None:
         st.session_state["user_team"] = user["team"]
     except (KeyError, IndexError, TypeError):
         st.session_state["user_team"] = None
+    # Drives the forced password-change gate (default password on a new
+    # account, or a temporary password set by an admin/manager reset).
+    try:
+        st.session_state["must_change_password"] = bool(user["must_change_password"])
+    except (KeyError, IndexError, TypeError):
+        st.session_state["must_change_password"] = False
 
 
 def logout() -> None:
     for key in [
         "authenticated", "user_id", "user_email", "user_name", "user_role", "user_team",
+        "must_change_password",
     ]:
         st.session_state.pop(key, None)
 

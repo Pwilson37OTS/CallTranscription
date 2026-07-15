@@ -46,6 +46,18 @@ class TestUserCRUD:
         with pytest.raises(ValueError, match="Disallowed user column"):
             db_mod.update_user(uid, email="hacker@evil.com")
 
+    def test_must_change_password_defaults_to_zero(self, db_mod, sample_user_record):
+        uid = db_mod.insert_user(sample_user_record)
+        user = db_mod.get_user_by_id(uid)
+        assert user["must_change_password"] == 0
+
+    def test_update_must_change_password(self, db_mod, sample_user_record):
+        uid = db_mod.insert_user(sample_user_record)
+        db_mod.update_user(uid, must_change_password=1)
+        assert db_mod.get_user_by_id(uid)["must_change_password"] == 1
+        db_mod.update_user(uid, must_change_password=0)
+        assert db_mod.get_user_by_id(uid)["must_change_password"] == 0
+
     def test_update_user_no_fields(self, db_mod, sample_user_record):
         uid = db_mod.insert_user(sample_user_record)
         # Should be a no-op, not raise
