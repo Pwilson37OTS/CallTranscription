@@ -56,6 +56,33 @@ def convert_audio_to_wav(input_path: Path) -> Path:
     return convert_file_to_wav(input_path, UPLOAD_DIR)
 
 
+def get_audio_duration_seconds(input_path: Path):
+    """Return the audio duration in seconds via ffprobe, or None if unavailable.
+
+    Used to decide whether to chunk a recording before transcription. Returns
+    None (rather than raising) when ffprobe is missing or the probe fails, so
+    callers can fall back to a size-based heuristic.
+    """
+    ffprobe = shutil.which("ffprobe")
+    if not ffprobe:
+        return None
+    try:
+        result = subprocess.run(
+            [
+                ffprobe, "-v", "error",
+                "-show_entries", "format=duration",
+                "-of", "default=noprint_wrappers=1:nokey=1",
+                str(input_path),
+            ],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode == 0 and result.stdout.strip():
+            return float(result.stdout.strip())
+    except (ValueError, OSError, subprocess.SubprocessError):
+        pass
+    return None
+
+
 def split_audio_for_transcription(
     input_path: Path,
     chunk_seconds: int = 600,

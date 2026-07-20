@@ -5,7 +5,7 @@ from time import time
 
 import streamlit as st
 
-from config import LOGO_PATH, RATE_LIMIT_PER_HOUR
+from config import LOGO_PATH, RATE_LIMIT_PER_HOUR, DEFAULT_TRANSCRIPTION_MODEL
 from styles import APP_CSS
 from db import (
     init_db, insert_call, update_call, get_all_calls, get_call,
@@ -82,7 +82,8 @@ def _record_api_call(user_id: int):
 
 
 # --- Defaults for the models (no longer user-selectable in the simplified UI) ---
-DEFAULT_TRANSCRIPTION_MODEL = "gpt-4o-transcribe"
+# Transcription model comes from config (TRANSCRIPTION_MODEL env var), so it can
+# be switched — e.g. to whisper-1 — without a code change/redeploy.
 DEFAULT_DIARIZATION_MODEL = "gpt-4.1"
 
 
@@ -730,6 +731,19 @@ with calls_tab:
                     if st.button("Retry Transcription", key=f"retry_{call['id']}"):
                         st.rerun()
                 else:
+                    if transcript_text and st.button(
+                        "Re-transcribe",
+                        key=f"retranscribe_{call['id']}",
+                        help="Regenerate the transcript from the audio. Use this if it "
+                             "looks wrong — e.g. a passage is repeated or the end is cut "
+                             "off. You may want to re-run Analyze Call afterward.",
+                    ):
+                        update_call(call["id"], transcript_text=None, status="uploaded")
+                        logger.info(
+                            "Manual re-transcribe requested: user_id=%d call_id=%d",
+                            current_user_id, call["id"],
+                        )
+                        st.rerun()
                     st.text_area(
                         "Transcript",
                         value=transcript_text or "",

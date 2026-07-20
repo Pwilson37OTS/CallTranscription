@@ -1,5 +1,7 @@
 import os
-from typing import Dict, Any
+import re
+from collections import Counter
+from typing import Dict, Any, Optional
 
 from openai import OpenAI
 
@@ -20,54 +22,141 @@ def get_openai_client() -> OpenAI:
 # off-by-one rounding or content-length overhead.
 _TRANSCRIBE_DIRECT_LIMIT_BYTES = 24 * 1024 * 1024
 
-# How long each chunk should be when we have to split. 10 minutes at 32kbps mono
-# MP3 is ~2.4 MB, well under the limit, and short enough that a stuck request
-# can't waste a huge amount of time.
-_TRANSCRIBE_CHUNK_SECONDS = 600
+# Chunk any recording longer than this. The transcription models have a bounded
+# output length, and they occasionally get stuck in a repetition loop that
+# consumes the whole output budget before reaching the end of the audio — which
+# both duplicates a passage AND drops the final minutes. Sending the call as
+# many short segments bounds the damage: the tail is in its own request with its
+# own budget, and a loop can only poison one segment (which we then retry).
+_TRANSCRIBE_CHUNK_THRESHOLD_SECONDS = 360   # 6 minutes
+_TRANSCRIBE_CHUNK_SECONDS = 300             # 5-minute segments
+
+# Fallback model used to re-transcribe a segment that came back repetitive.
+_TRANSCRIBE_FALLBACK_MODEL = "whisper-1"
 
 
-def _transcribe_single_file(file_path: str, model: str) -> str:
+def _transcribe_single_file(
+    file_path: str,
+    model: str,
+    temperature: Optional[float] = None,
+    prompt: Optional[str] = None,
+) -> str:
     """Send one audio file to the OpenAI transcription endpoint."""
     client = get_openai_client()
+    kwargs: Dict[str, Any] = {"model": model}
+    if temperature is not None:
+        kwargs["temperature"] = temperature
+    if prompt:
+        kwargs["prompt"] = prompt
     with open(file_path, "rb") as audio_file:
-        transcript = client.audio.transcriptions.create(
-            model=model,
-            file=audio_file,
-        )
+        transcript = client.audio.transcriptions.create(file=audio_file, **kwargs)
     return transcript.text
 
 
-def transcribe_audio(file_path: str, model: str = "gpt-4o-transcribe") -> str:
-    """Transcribe an audio file. Auto-chunks for files larger than the API limit.
+def _looks_repetitive(text: str) -> bool:
+    """Heuristic detector for transcription repetition-loop failures.
 
-    For typical CloudCall recordings under ~50 minutes / 24 MB this is a single
-    request. For longer calls we split with ffmpeg into ~10 minute MP3 chunks
-    and concatenate the transcripts. Speaker diarization runs after, on the
-    combined text.
+    Flags output where the model got stuck repeating a passage. Uses only
+    substantive sentences (>=15 chars) so normal short filler ("Yes, sir.")
+    doesn't trip it. Three signals:
+      - the same sentence repeated 4+ times back-to-back,
+      - a single sentence appearing 6+ times overall,
+      - more than half of the substantive sentences being exact duplicates.
+    Real recruiter calls repeat some phrases, but not at these levels.
+    """
+    if not text:
+        return False
+
+    parts = [p.strip().lower() for p in re.split(r"[.!?\n]+", text) if len(p.strip()) >= 15]
+    if len(parts) < 6:
+        return False
+
+    # Longest run of the same sentence appearing consecutively.
+    longest_run = run = 1
+    for i in range(1, len(parts)):
+        run = run + 1 if parts[i] == parts[i - 1] else 1
+        longest_run = max(longest_run, run)
+    if longest_run >= 4:
+        return True
+
+    counts = Counter(parts)
+    most_common_count = counts.most_common(1)[0][1]
+    if most_common_count >= 6:
+        return True
+
+    duplicate_ratio = 1 - (len(counts) / len(parts))
+    if len(parts) >= 10 and duplicate_ratio > 0.5:
+        return True
+
+    return False
+
+
+def _transcribe_segment(file_path: str, model: str) -> str:
+    """Transcribe one file, retrying with a fallback model if the result loops.
+
+    Returns the best available text. If the fallback also loops, the loop is
+    logged and the fallback text is returned (it's usually less corrupted than
+    the primary), so the pipeline still gets whatever was salvageable.
+    """
+    text = _transcribe_single_file(file_path, model)
+    if not _looks_repetitive(text):
+        return text
+
+    logger.warning(
+        "Repetitive transcription detected (model=%s, file=%s); retrying with %s",
+        model, file_path, _TRANSCRIBE_FALLBACK_MODEL,
+    )
+    try:
+        fallback = _transcribe_single_file(
+            file_path, _TRANSCRIBE_FALLBACK_MODEL, temperature=0.0
+        )
+    except Exception as e:
+        logger.warning("Fallback transcription failed for %s: %s", file_path, e)
+        return text
+
+    if _looks_repetitive(fallback):
+        logger.warning(
+            "Fallback transcription also looked repetitive (file=%s); "
+            "using fallback text anyway", file_path,
+        )
+    return fallback
+
+
+def transcribe_audio(file_path: str, model: str = "gpt-4o-transcribe") -> str:
+    """Transcribe an audio file, chunking longer calls into short segments.
+
+    Recordings longer than ~6 minutes (or over the 24 MB single-request limit)
+    are split with ffmpeg into ~5-minute MP3 segments and transcribed
+    independently, then concatenated. Each segment is guarded against the
+    models' repetition-loop failure mode (see `_transcribe_segment`). Speaker
+    diarization runs afterward on the combined text.
     """
     from pathlib import Path
+    from file_service import get_audio_duration_seconds, split_audio_for_transcription
+
     path_obj = Path(file_path)
     size_bytes = path_obj.stat().st_size
+    duration = get_audio_duration_seconds(path_obj)
 
     logger.info(
-        "Transcription started: model=%s file=%s size_mb=%.1f",
+        "Transcription started: model=%s file=%s size_mb=%.1f duration=%s",
         model, file_path, size_bytes / (1024 * 1024),
+        f"{duration:.0f}s" if duration else "unknown",
     )
 
-    # Small enough → single request, original behavior.
-    if size_bytes <= _TRANSCRIBE_DIRECT_LIMIT_BYTES:
-        text = _transcribe_single_file(file_path, model)
+    # Decide whether to chunk. Prefer duration; fall back to file size when
+    # ffprobe isn't available (short calls stay a single request).
+    if duration is not None:
+        needs_chunking = duration > _TRANSCRIBE_CHUNK_THRESHOLD_SECONDS
+    else:
+        needs_chunking = size_bytes > _TRANSCRIBE_DIRECT_LIMIT_BYTES
+
+    if not needs_chunking:
+        text = _transcribe_segment(file_path, model)
         logger.info("Transcription complete: model=%s chars=%d", model, len(text))
         return text
 
-    # Over the per-request limit → chunk and stitch.
-    from file_service import split_audio_for_transcription
-    logger.info(
-        "File exceeds %d MB single-request limit; chunking into %ds segments",
-        _TRANSCRIBE_DIRECT_LIMIT_BYTES // (1024 * 1024),
-        _TRANSCRIBE_CHUNK_SECONDS,
-    )
-
+    logger.info("Chunking recording into %ds segments", _TRANSCRIBE_CHUNK_SECONDS)
     chunks = split_audio_for_transcription(
         path_obj, chunk_seconds=_TRANSCRIBE_CHUNK_SECONDS
     )
@@ -80,8 +169,7 @@ def transcribe_audio(file_path: str, model: str = "gpt-4o-transcribe") -> str:
                 i, len(chunks), chunk_path.name,
                 chunk_path.stat().st_size / (1024 * 1024),
             )
-            part_text = _transcribe_single_file(str(chunk_path), model)
-            parts.append(part_text)
+            parts.append(_transcribe_segment(str(chunk_path), model))
 
         combined = "\n\n".join(parts)
         logger.info(
