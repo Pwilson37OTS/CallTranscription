@@ -21,7 +21,11 @@ from cloudcall_config import (
     CLOUDCALL_POLL_END_HOUR_CT,
 )
 from cloudcall_db import init_cloudcall_tables
-from cloudcall_service import poll_recent_recordings
+from cloudcall_service import (
+    poll_recent_recordings,
+    record_poll_success,
+    record_poll_failure,
+)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -59,9 +63,11 @@ def main():
         if is_within_business_hours():
             try:
                 inserted = poll_recent_recordings()
+                record_poll_success(inserted)
                 if inserted > 0:
                     logger.info("Poll cycle: %d new recordings", inserted)
             except Exception as e:
+                record_poll_failure(str(e))
                 logger.error("Poll cycle failed: %s", e)
         else:
             now_ct = datetime.now(CT)

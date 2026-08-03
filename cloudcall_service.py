@@ -121,6 +121,89 @@ def clear_stored_tokens() -> None:
     logger.info("CloudCall token cache cleared; next refresh will use the env var")
 
 
+# ---------------------------------------------------------------------------
+# Poller health: the poller records each cycle so the UI can surface a stalled
+# poller / expired token instead of failing silently for hours.
+# ---------------------------------------------------------------------------
+def _ensure_poller_health_table(conn) -> None:
+    conn.execute(
+        "CREATE TABLE IF NOT EXISTS cloudcall_poller_health ("
+        "  id INTEGER PRIMARY KEY CHECK (id = 1),"
+        "  last_success_at REAL, last_attempt_at REAL,"
+        "  last_error TEXT, last_error_at REAL,"
+        "  last_inserted INTEGER"
+        ")"
+    )
+
+
+def record_poll_success(inserted: int = 0) -> None:
+    """Record a successful poll cycle (clears any prior error)."""
+    now = time()
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        _ensure_poller_health_table(conn)
+        conn.execute(
+            "INSERT INTO cloudcall_poller_health "
+            "(id, last_success_at, last_attempt_at, last_error, last_error_at, last_inserted) "
+            "VALUES (1, ?, ?, '', 0, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "last_success_at=excluded.last_success_at, last_attempt_at=excluded.last_attempt_at, "
+            "last_error='', last_error_at=0, last_inserted=excluded.last_inserted",
+            (now, now, inserted),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def record_poll_failure(error_msg: str) -> None:
+    """Record a failed poll cycle (preserves the last-success timestamp)."""
+    now = time()
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        _ensure_poller_health_table(conn)
+        conn.execute(
+            "INSERT INTO cloudcall_poller_health (id, last_attempt_at, last_error, last_error_at) "
+            "VALUES (1, ?, ?, ?) "
+            "ON CONFLICT(id) DO UPDATE SET "
+            "last_attempt_at=excluded.last_attempt_at, last_error=excluded.last_error, "
+            "last_error_at=excluded.last_error_at",
+            (now, (error_msg or "")[:1000], now),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def get_poller_health() -> Dict[str, Any]:
+    """Return the poller's last success/attempt/error for the health UI."""
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        _ensure_poller_health_table(conn)
+        row = conn.execute(
+            "SELECT last_success_at, last_attempt_at, last_error, last_error_at, last_inserted "
+            "FROM cloudcall_poller_health WHERE id = 1"
+        ).fetchone()
+    finally:
+        conn.close()
+    if not row:
+        return {"last_success_at": 0.0, "last_attempt_at": 0.0,
+                "last_error": "", "last_error_at": 0.0, "last_inserted": 0}
+    return {
+        "last_success_at": row[0] or 0.0,
+        "last_attempt_at": row[1] or 0.0,
+        "last_error": row[2] or "",
+        "last_error_at": row[3] or 0.0,
+        "last_inserted": row[4] or 0,
+    }
+
+
+def is_auth_error(msg: str) -> bool:
+    """True if an error message looks like a CloudCall auth/token failure."""
+    m = (msg or "").lower()
+    return "invalid_grant" in m or "token refresh rejected" in m or "not configured" in m
+
+
 def _do_refresh(refresh_token: str, source: str) -> Dict[str, Any]:
     """Exchange a refresh token for a new access token (+ rotated refresh token)."""
     with httpx.Client(timeout=30.0) as client:

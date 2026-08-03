@@ -96,3 +96,40 @@ def test_clear_stored_tokens_safe_when_empty(tmp_path, monkeypatch):
     # Should not raise even when nothing has been stored yet.
     ccs.clear_stored_tokens()
     assert ccs._get_stored_tokens()["refresh_token"] == ""
+
+
+def test_poller_health_success_and_failure(tmp_path, monkeypatch):
+    import cloudcall_service as ccs
+
+    monkeypatch.setattr(ccs, "DB_PATH", tmp_path / "h.db")
+
+    # Fresh DB → empty health.
+    h0 = ccs.get_poller_health()
+    assert h0["last_success_at"] == 0.0 and h0["last_error"] == ""
+
+    ccs.record_poll_success(inserted=3)
+    h1 = ccs.get_poller_health()
+    assert h1["last_success_at"] > 0
+    assert h1["last_inserted"] == 3
+    assert h1["last_error"] == ""
+
+    # A failure preserves the last-success timestamp and records the error.
+    ccs.record_poll_failure("CloudCall token refresh rejected: invalid_grant")
+    h2 = ccs.get_poller_health()
+    assert h2["last_success_at"] == h1["last_success_at"]  # preserved
+    assert "invalid_grant" in h2["last_error"]
+    assert h2["last_error_at"] > 0
+
+    # A later success clears the error again.
+    ccs.record_poll_success(inserted=0)
+    h3 = ccs.get_poller_health()
+    assert h3["last_error"] == ""
+
+
+def test_is_auth_error():
+    import cloudcall_service as ccs
+
+    assert ccs.is_auth_error('CloudCall token refresh rejected (source=env): {"error":"invalid_grant"}')
+    assert ccs.is_auth_error("CLOUDCALL_REFRESH_TOKEN is not configured")
+    assert not ccs.is_auth_error("Failed to get recording URL: 404")
+    assert not ccs.is_auth_error("")

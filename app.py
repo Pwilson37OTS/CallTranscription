@@ -21,7 +21,12 @@ from auth import (
 )
 from logging_config import logger
 from storage import storage
-from cloudcall_config import CLOUDCALL_ENABLED, CLOUDCALL_RECORDING_RETENTION_HOURS
+from cloudcall_config import (
+    CLOUDCALL_ENABLED,
+    CLOUDCALL_RECORDING_RETENTION_HOURS,
+    CLOUDCALL_POLL_START_HOUR_CT,
+    CLOUDCALL_POLL_END_HOUR_CT,
+)
 
 # ============================================================
 # ECHO — Recruiter call review and coaching
@@ -290,6 +295,53 @@ with hero_right:
         """,
         unsafe_allow_html=True,
     )
+
+
+# -----------------------------
+# CloudCall poller health banner (admins + managers) — surfaces a stalled
+# poller / expired token at the top of the app instead of failing silently.
+# -----------------------------
+def _render_poller_health_banner():
+    from cloudcall_service import get_poller_health, is_auth_error
+    from zoneinfo import ZoneInfo
+
+    health = get_poller_health()
+    now_ts = time()
+    last_success = health["last_success_at"]
+    last_error = health["last_error"]
+    last_error_at = health["last_error_at"]
+
+    # Auth/token failure takes priority — most urgent and most common.
+    if last_error and is_auth_error(last_error) and last_error_at >= last_success:
+        st.error(
+            "🔴 **CloudCall authentication is failing** — the token appears expired or "
+            "invalid, so **new calls are not being ingested**. Regenerate the token in "
+            "CloudCall, update the Railway variable, redeploy, then use "
+            "**Admin → CloudCall Authentication → Reset CloudCall Auth**."
+        )
+        return
+
+    # Otherwise, warn if the poller has stalled during business hours.
+    now_ct = datetime.now(ZoneInfo("America/Chicago"))
+    in_hours = CLOUDCALL_POLL_START_HOUR_CT <= now_ct.hour < CLOUDCALL_POLL_END_HOUR_CT
+    if not in_hours:
+        return
+    if not last_success:
+        st.warning(
+            "🟠 **CloudCall poller:** no successful poll recorded yet. If this persists "
+            "during business hours, check the poller logs."
+        )
+    elif now_ts - last_success > 3600:
+        mins = int((now_ts - last_success) // 60)
+        st.error(
+            f"🔴 **CloudCall poller stalled** — last successful poll was ~{mins} min ago. "
+            "New calls may not be ingesting. Check **Admin → CloudCall Ingest Status** and "
+            "the poller logs."
+        )
+
+
+if CLOUDCALL_ENABLED and (user_is_admin or user_is_manager):
+    _render_poller_health_banner()
 
 
 # -----------------------------
@@ -1335,7 +1387,37 @@ if admin_tab is not None:
                 try_ingest_calls,
                 clear_stored_tokens,
                 get_access_token,
+                get_poller_health,
             )
+
+            # --- Poller Health (Admin only) ---
+            st.markdown("---")
+            st.markdown("### CloudCall Poller Health")
+            _ph = get_poller_health()
+            from zoneinfo import ZoneInfo as _ZI_ph
+            _ct_ph = _ZI_ph("America/Chicago")
+
+            def _fmt_ph(ts):
+                if not ts:
+                    return "—"
+                try:
+                    return datetime.fromtimestamp(ts, _ct_ph).strftime("%b %d, %Y %I:%M %p CT")
+                except Exception:
+                    return "—"
+
+            ph_cols = st.columns(3)
+            with ph_cols[0]:
+                st.metric("Last successful poll", _fmt_ph(_ph["last_success_at"]))
+            with ph_cols[1]:
+                st.metric("Last attempt", _fmt_ph(_ph["last_attempt_at"]))
+            with ph_cols[2]:
+                st.metric("New calls (last poll)", _ph["last_inserted"])
+            if _ph["last_error"]:
+                st.error(
+                    f"Last poll error ({_fmt_ph(_ph['last_error_at'])}): {_ph['last_error']}"
+                )
+            else:
+                st.caption("No poll errors recorded.")
 
             # --- CloudCall Authentication (Admin only) ---
             st.markdown("---")
