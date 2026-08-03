@@ -96,6 +96,31 @@ def _store_tokens(access_token: str, refresh_token: str, expires_at: float):
         conn.close()
 
 
+def clear_stored_tokens() -> None:
+    """Wipe ECHO's cached CloudCall tokens so the next refresh bootstraps
+    cleanly from the CLOUDCALL_REFRESH_TOKEN env var.
+
+    get_access_token() prefers the DB-stored refresh token over the env var
+    (``current_refresh = stored["refresh_token"] or CLOUDCALL_REFRESH_TOKEN``).
+    After the token is rotated in CloudCall + Railway, a stale DB copy keeps
+    getting tried first and failing with invalid_grant, so the fresh env token
+    never takes over. Clearing the cache forces the next refresh to use the env
+    var directly. This does NOT touch the env var itself.
+    """
+    global _access_token, _access_token_expires_at
+    _access_token = ""
+    _access_token_expires_at = 0.0
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    try:
+        conn.execute("DELETE FROM cloudcall_tokens WHERE id = 1")
+        conn.commit()
+    except sqlite3.OperationalError:
+        pass  # table doesn't exist yet — nothing cached to clear
+    finally:
+        conn.close()
+    logger.info("CloudCall token cache cleared; next refresh will use the env var")
+
+
 def get_access_token() -> str:
     """Get a valid CloudCall access token, refreshing if needed.
 
@@ -138,6 +163,7 @@ def get_access_token() -> str:
         return r.json()
 
     source = "stored" if stored["refresh_token"] else "env"
+    logger.info("CloudCall access token refresh needed; attempting with %s token", source)
     try:
         token_data = _do_refresh(current_refresh, source)
     except RuntimeError as e:

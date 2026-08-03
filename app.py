@@ -1333,7 +1333,44 @@ if admin_tab is not None:
                 revalidate_imported_recordings,
                 inspect_call_logs,
                 try_ingest_calls,
+                clear_stored_tokens,
+                get_access_token,
             )
+
+            # --- CloudCall Authentication (Admin only) ---
+            st.markdown("---")
+            st.markdown("### CloudCall Authentication")
+            st.caption(
+                "ECHO caches the CloudCall token in its database and prefers it "
+                "over the Railway env var. After you rotate the token in CloudCall "
+                "+ Railway, a stale cached token can keep failing with "
+                "`invalid_grant` — so the fresh env token never takes over. "
+                "Clear the cache to force a clean refresh from the env var."
+            )
+            if st.button(
+                "Reset CloudCall Auth (clear cached token)",
+                key="reset_cc_auth_btn",
+                help="Deletes ECHO's cached token, then immediately tries to "
+                     "refresh using the CLOUDCALL_REFRESH_TOKEN env var.",
+            ):
+                try:
+                    clear_stored_tokens()
+                    with st.spinner("Cleared cache; refreshing from the env token..."):
+                        get_access_token()
+                    logger.info("Reset CloudCall auth: refresh succeeded, user_id=%d", current_user_id)
+                    st.success(
+                        "CloudCall authentication restored — the env token "
+                        "refreshed successfully. The poller will resume on its "
+                        "next cycle."
+                    )
+                except Exception as e:
+                    logger.error("Reset CloudCall auth failed: user_id=%d error=%s", current_user_id, e)
+                    st.error(
+                        f"Still failing after clearing the cache: {e}\n\n"
+                        "This means the env token itself is being rejected — "
+                        "regenerate it in CloudCall (Company Settings → CloudCall "
+                        "API), update the Railway variable, redeploy, then reset again."
+                    )
 
             st.markdown("---")
             st.markdown("### CloudCall Ingest Status")
