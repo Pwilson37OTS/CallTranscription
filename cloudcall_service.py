@@ -121,11 +121,127 @@ def clear_stored_tokens() -> None:
     logger.info("CloudCall token cache cleared; next refresh will use the env var")
 
 
+def _do_refresh(refresh_token: str, source: str) -> Dict[str, Any]:
+    """Exchange a refresh token for a new access token (+ rotated refresh token)."""
+    with httpx.Client(timeout=30.0) as client:
+        r = client.post(
+            CLOUDCALL_AUTH_URL,
+            data={
+                "client_id": CLOUDCALL_CLIENT_ID,
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+            },
+        )
+    if r.status_code != 200:
+        body = (r.text or "")[:500]
+        raise RuntimeError(
+            f"CloudCall token refresh rejected (source={source}, status={r.status_code}): {body}"
+        )
+    return r.json()
+
+
+def _refresh_access_token_locked() -> str:
+    """Refresh the access token under a cross-process write lock.
+
+    CloudCall refresh tokens are single-use: each refresh rotates the token and
+    kills the old one. If the poller, Streamlit, and webhook processes refresh
+    at the same instant they present the same token — CloudCall honors one and
+    rejects the rest with invalid_grant, corrupting the shared token state. That
+    race was the main cause of ECHO's recurring token failures.
+
+    We serialize with a SQLite ``BEGIN IMMEDIATE`` write lock (autocommit conn so
+    the BEGIN is explicit): only one process refreshes at a time. After acquiring
+    the lock we re-read the DB — another process may have just refreshed while we
+    waited — and reuse its token instead of burning another refresh.
+    """
+    global _access_token, _access_token_expires_at
+
+    conn = sqlite3.connect(DB_PATH, timeout=30, isolation_level=None)
+    try:
+        conn.execute(
+            "CREATE TABLE IF NOT EXISTS cloudcall_tokens ("
+            "  id INTEGER PRIMARY KEY CHECK (id = 1),"
+            "  access_token TEXT, refresh_token TEXT,"
+            "  expires_at REAL"
+            ")"
+        )
+        # Acquire the cross-process write lock. Other refreshers block here
+        # (up to the connection timeout) until we COMMIT/ROLLBACK.
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            row = conn.execute(
+                "SELECT access_token, refresh_token, expires_at FROM cloudcall_tokens WHERE id = 1"
+            ).fetchone()
+            stored = {
+                "access_token": (row[0] if row else "") or "",
+                "refresh_token": (row[1] if row else "") or "",
+                "expires_at": (row[2] if row else 0.0) or 0.0,
+            }
+
+            # Double-check: another process may have refreshed while we waited
+            # for the lock. If the stored access token is now valid, use it.
+            if stored["access_token"] and time() < (stored["expires_at"] - 300):
+                conn.execute("COMMIT")
+                _access_token = stored["access_token"]
+                _access_token_expires_at = stored["expires_at"]
+                return _access_token
+
+            current_refresh = stored["refresh_token"] or CLOUDCALL_REFRESH_TOKEN
+            if not current_refresh:
+                raise RuntimeError("CLOUDCALL_REFRESH_TOKEN is not configured")
+
+            source = "stored" if stored["refresh_token"] else "env"
+            logger.info("CloudCall access token refresh needed; attempting with %s token", source)
+            try:
+                token_data = _do_refresh(current_refresh, source)
+            except RuntimeError as e:
+                # The DB-stored token got rotated/invalidated but the env-var
+                # bootstrap may still be valid. Retry once with that.
+                if (
+                    source == "stored"
+                    and CLOUDCALL_REFRESH_TOKEN
+                    and CLOUDCALL_REFRESH_TOKEN != current_refresh
+                ):
+                    logger.warning(
+                        "Stored refresh token rejected; retrying with env-var bootstrap. Original error: %s", e
+                    )
+                    token_data = _do_refresh(CLOUDCALL_REFRESH_TOKEN, "env-fallback")
+                else:
+                    raise
+
+            access_token = token_data["access_token"]
+            expires_at = time() + token_data.get("expires_in", 86400)
+            new_refresh = token_data.get("refresh_token", current_refresh)
+
+            conn.execute(
+                "INSERT OR REPLACE INTO cloudcall_tokens (id, access_token, refresh_token, expires_at) "
+                "VALUES (1, ?, ?, ?)",
+                (access_token, new_refresh, expires_at),
+            )
+            conn.execute("COMMIT")
+
+            _access_token = access_token
+            _access_token_expires_at = expires_at
+            logger.info("CloudCall access token refreshed, expires in %ds", token_data.get("expires_in", 0))
+            return _access_token
+        except Exception:
+            # Release the write lock on any failure so we don't wedge other
+            # processes (they'd otherwise block until the timeout).
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise
+    finally:
+        conn.close()
+
+
 def get_access_token() -> str:
     """Get a valid CloudCall access token, refreshing if needed.
 
-    Tokens are shared across processes (poller + Streamlit) via SQLite.
-    The refresh token is single-use: each refresh returns a new one.
+    Tokens are shared across processes (poller + Streamlit) via SQLite. The
+    refresh itself is serialized across processes (see
+    _refresh_access_token_locked) because the refresh token is single-use.
     """
     global _access_token, _access_token_expires_at
 
@@ -140,53 +256,8 @@ def get_access_token() -> str:
         _access_token_expires_at = stored["expires_at"]
         return _access_token
 
-    # Need to refresh — use stored refresh token or env var as fallback
-    current_refresh = stored["refresh_token"] or CLOUDCALL_REFRESH_TOKEN
-    if not current_refresh:
-        raise RuntimeError("CLOUDCALL_REFRESH_TOKEN is not configured")
-
-    def _do_refresh(refresh_token: str, source: str) -> Dict[str, Any]:
-        with httpx.Client(timeout=30.0) as client:
-            r = client.post(
-                CLOUDCALL_AUTH_URL,
-                data={
-                    "client_id": CLOUDCALL_CLIENT_ID,
-                    "grant_type": "refresh_token",
-                    "refresh_token": refresh_token,
-                },
-            )
-        if r.status_code != 200:
-            body = (r.text or "")[:500]
-            raise RuntimeError(
-                f"CloudCall token refresh rejected (source={source}, status={r.status_code}): {body}"
-            )
-        return r.json()
-
-    source = "stored" if stored["refresh_token"] else "env"
-    logger.info("CloudCall access token refresh needed; attempting with %s token", source)
-    try:
-        token_data = _do_refresh(current_refresh, source)
-    except RuntimeError as e:
-        # Common case: the DB-stored token got rotated/invalidated but the
-        # original env-var bootstrap is still valid. Retry once with that.
-        if (
-            source == "stored"
-            and CLOUDCALL_REFRESH_TOKEN
-            and CLOUDCALL_REFRESH_TOKEN != current_refresh
-        ):
-            logger.warning("Stored refresh token rejected; retrying with env-var bootstrap. Original error: %s", e)
-            token_data = _do_refresh(CLOUDCALL_REFRESH_TOKEN, "env-fallback")
-        else:
-            raise
-    _access_token = token_data["access_token"]
-    _access_token_expires_at = time() + token_data.get("expires_in", 86400)
-    new_refresh = token_data.get("refresh_token", current_refresh)
-
-    # Persist so other processes can use the new tokens
-    _store_tokens(_access_token, new_refresh, _access_token_expires_at)
-
-    logger.info("CloudCall access token refreshed, expires in %ds", token_data.get("expires_in", 0))
-    return _access_token
+    # Stale/absent → refresh under the cross-process lock.
+    return _refresh_access_token_locked()
 
 
 def download_recording(recording_url: str, cloudcall_recording_id: str) -> Path:
