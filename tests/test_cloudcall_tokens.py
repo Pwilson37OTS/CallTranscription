@@ -133,3 +133,18 @@ def test_is_auth_error():
     assert ccs.is_auth_error("CLOUDCALL_REFRESH_TOKEN is not configured")
     assert not ccs.is_auth_error("Failed to get recording URL: 404")
     assert not ccs.is_auth_error("")
+
+
+def test_catchup_lookback_clamped_to_retention(monkeypatch):
+    import cloudcall_config as cfg
+    import cloudcall_service as ccs
+
+    # Under retention → used as configured.
+    monkeypatch.setattr(cfg, "CLOUDCALL_CATCHUP_LOOKBACK_HOURS", 24)
+    monkeypatch.setattr(cfg, "CLOUDCALL_RECORDING_RETENTION_HOURS", 96)
+    assert ccs.catchup_lookback_minutes() == 24 * 60
+
+    # Over retention → clamped to retention so we never re-fetch purged calls.
+    monkeypatch.setattr(cfg, "CLOUDCALL_CATCHUP_LOOKBACK_HOURS", 240)
+    monkeypatch.setattr(cfg, "CLOUDCALL_RECORDING_RETENTION_HOURS", 96)
+    assert ccs.catchup_lookback_minutes() == 96 * 60

@@ -35,6 +35,19 @@ CLOUDCALL_POLL_INTERVAL_MINUTES = int(os.getenv("CLOUDCALL_POLL_INTERVAL_MINUTES
 CLOUDCALL_POLL_START_HOUR_CT = int(os.getenv("CLOUDCALL_POLL_START_HOUR_CT", "6"))   # 6 AM Central
 CLOUDCALL_POLL_END_HOUR_CT = int(os.getenv("CLOUDCALL_POLL_END_HOUR_CT", "18"))      # 6 PM Central
 
+# Self-healing catch-up poll. The regular poll only looks back ~60 min, so a
+# gap longer than that (dead token, crash, deploy) is never re-fetched and the
+# calls are lost until a manual pull. The catch-up poll periodically re-scans a
+# much wider window; re-polling is idempotent (already-seen recordings are
+# skipped), so it only does real work for genuinely missing calls. It also runs
+# once on poller startup to heal deploy/restart gaps.
+#
+# LOOKBACK must stay UNDER the retention window — a wider window would re-fetch
+# calls the cleanup sweep already purged and re-create them as duplicates. The
+# effective value is clamped to retention at runtime.
+CLOUDCALL_CATCHUP_INTERVAL_MINUTES = int(os.getenv("CLOUDCALL_CATCHUP_INTERVAL_MINUTES", "15"))
+CLOUDCALL_CATCHUP_LOOKBACK_HOURS = int(os.getenv("CLOUDCALL_CATCHUP_LOOKBACK_HOURS", "24"))
+
 # Feature flag: enabled when refresh token is configured
 CLOUDCALL_ENABLED = bool(CLOUDCALL_REFRESH_TOKEN)
 

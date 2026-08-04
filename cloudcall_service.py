@@ -204,6 +204,18 @@ def is_auth_error(msg: str) -> bool:
     return "invalid_grant" in m or "token refresh rejected" in m or "not configured" in m
 
 
+def catchup_lookback_minutes() -> int:
+    """Lookback (minutes) for the self-healing catch-up poll.
+
+    Clamped to the retention window: a wider window would re-fetch calls the
+    cleanup sweep already purged and re-create them as duplicate rows. Read
+    from the config module at call time so overrides/tests are picked up.
+    """
+    import cloudcall_config as _cfg
+    hours = min(_cfg.CLOUDCALL_CATCHUP_LOOKBACK_HOURS, _cfg.CLOUDCALL_RECORDING_RETENTION_HOURS)
+    return max(hours, 1) * 60
+
+
 def _do_refresh(refresh_token: str, source: str) -> Dict[str, Any]:
     """Exchange a refresh token for a new access token (+ rotated refresh token)."""
     with httpx.Client(timeout=30.0) as client:
