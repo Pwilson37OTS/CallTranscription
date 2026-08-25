@@ -38,6 +38,11 @@ class TestRepetitionDetection:
         assert _looks_repetitive("") is False
         assert _looks_repetitive("Hi. Yes. OK.") is False
 
+    def test_flags_short_token_loop(self):
+        # The silence-hallucination signature: one short word repeated forever.
+        assert _looks_repetitive("Okay. " * 50) is True
+        assert _looks_repetitive("Yeah. " * 40) is True
+
     def test_light_legitimate_repetition_passes(self):
         # A recruiter genuinely repeating one confirmation must not trip it.
         text = (
@@ -115,7 +120,8 @@ class TestTranscribeAudio:
         audio_file.write_bytes(b"fake audio data")
 
         thin = MagicMock(); thin.text = "Hello. Bonsoir a tous. Das ist gut."
-        good = MagicMock(); good.text = " ".join(["word"] * 400)
+        # A realistic dense transcript (varied words, so it isn't flagged as a loop).
+        good = MagicMock(); good.text = " ".join(f"word{i}" for i in range(400))
         mock_client = MagicMock()
         mock_client.audio.transcriptions.create.side_effect = [thin, good]
         mock_get_client.return_value = mock_client
@@ -156,7 +162,23 @@ class TestTranscribeAudio:
         mock_split.return_value = [c0]
         mock_seg.side_effect = [Exception("boom")]
 
-        with pytest.raises(RuntimeError, match="every audio segment"):
+        with pytest.raises(RuntimeError, match="No usable speech"):
+            transcribe_audio(str(audio_file), model="whisper-1")
+
+    @patch("file_service.get_audio_duration_seconds", return_value=120.0)
+    @patch("openai_service.get_openai_client")
+    def test_raises_when_both_models_loop(self, mock_get_client, mock_dur, tmp_path):
+        # Silence-induced loop that both models produce → dropped → surfaced as
+        # a retryable error rather than storing "Okay. Okay. Okay." garbage.
+        audio_file = tmp_path / "silence.wav"
+        audio_file.write_bytes(b"fake audio data")
+
+        loop = MagicMock(); loop.text = "Okay. " * 60
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.side_effect = [loop, loop]
+        mock_get_client.return_value = mock_client
+
+        with pytest.raises(RuntimeError, match="No usable speech"):
             transcribe_audio(str(audio_file), model="whisper-1")
 
 

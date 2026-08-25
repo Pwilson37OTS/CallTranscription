@@ -80,6 +80,19 @@ def _looks_repetitive(text: str) -> bool:
     if not text:
         return False
 
+    # Word-level loop: the model repeating one short token ("Okay. Okay. Okay."
+    # — the silence-hallucination signature). The sentence checks below skip
+    # fragments under 15 chars, so they miss this; catch it via word dominance
+    # and vocabulary diversity.
+    words = re.findall(r"[a-z0-9']+", text.lower())
+    if len(words) >= 20:
+        counts = Counter(words)
+        top_count = counts.most_common(1)[0][1]
+        if top_count / len(words) > 0.4:          # one word is >40% of all words
+            return True
+        if len(counts) / len(words) < 0.15:       # very low vocabulary diversity
+            return True
+
     parts = [p.strip().lower() for p in re.split(r"[.!?\n]+", text) if len(p.strip()) >= 15]
     if len(parts) < 6:
         return False
@@ -145,15 +158,19 @@ def _transcribe_segment(file_path: str, model: str, duration_seconds=None) -> st
         fallback = _transcribe_single_file(file_path, fallback_model, temperature=temp)
     except Exception as e:
         logger.warning("Fallback transcription failed for %s: %s", file_path, e)
-        return text
+        fallback = None
 
-    if _is_bad_transcript(fallback, duration_seconds):
-        logger.warning(
-            "Both models produced low-quality transcription (file=%s); "
-            "keeping the longer result", file_path,
-        )
-        return fallback if len(fallback or "") > len(text or "") else text
-    return fallback
+    # Keep the non-looping result with the most content. A repetition loop
+    # ("Okay. Okay. Okay." on silence) is garbage — never keep it. If both
+    # results loop, drop the segment entirely (return "") so the loop doesn't
+    # pollute the transcript; a genuinely silent segment contributes nothing.
+    candidates = [t for t in (fallback, text) if t and not _looks_repetitive(t)]
+    if candidates:
+        return max(candidates, key=len)
+    logger.warning(
+        "Both models produced looping/garbage output (file=%s); dropping segment", file_path
+    )
+    return ""
 
 
 def transcribe_audio(file_path: str, model: str = "gpt-4o-transcribe") -> str:
@@ -191,6 +208,8 @@ def transcribe_audio(file_path: str, model: str = "gpt-4o-transcribe") -> str:
 
     if not needs_chunking:
         text = _transcribe_segment(file_path, model, duration_seconds=duration)
+        if not text.strip():
+            raise RuntimeError("No usable speech could be transcribed from the recording.")
         logger.info("Transcription complete: model=%s chars=%d", model, len(text))
         return text
 
@@ -201,7 +220,7 @@ def transcribe_audio(file_path: str, model: str = "gpt-4o-transcribe") -> str:
     chunks_dir = chunks[0].parent
     try:
         parts = []
-        real_parts = 0  # chunks that produced actual transcript text (not a gap marker)
+        real_parts = 0  # chunks that produced actual transcript text
         for i, chunk_path in enumerate(chunks, start=1):
             logger.info(
                 "Transcribing chunk %d/%d: %s (%.1f MB)",
@@ -210,20 +229,24 @@ def transcribe_audio(file_path: str, model: str = "gpt-4o-transcribe") -> str:
             )
             chunk_duration = get_audio_duration_seconds(chunk_path)
             try:
-                parts.append(_transcribe_segment(str(chunk_path), model, duration_seconds=chunk_duration))
-                real_parts += 1
+                seg = _transcribe_segment(str(chunk_path), model, duration_seconds=chunk_duration)
             except Exception as e:
-                # One chunk failing (both models errored) must not throw away the
+                # One chunk erroring (both models raised) must not throw away the
                 # whole call — leave a labeled gap and keep the other segments.
-                logger.error(
-                    "Chunk %d/%d failed permanently: %s", i, len(chunks), e
-                )
+                logger.error("Chunk %d/%d failed permanently: %s", i, len(chunks), e)
                 parts.append(f"[Transcription unavailable for audio segment {i} of {len(chunks)}]")
+                continue
+            if seg.strip():
+                parts.append(seg)
+                real_parts += 1
+            else:
+                # Segment was silence / looping garbage that got dropped.
+                logger.info("Chunk %d/%d had no usable speech (dropped)", i, len(chunks))
 
         if real_parts == 0:
-            # Nothing transcribed at all — surface as an error (retryable) rather
-            # than storing a transcript that's only gap markers.
-            raise RuntimeError("Transcription failed for every audio segment.")
+            # Nothing usable transcribed — surface as an error (retryable) rather
+            # than storing an empty or gap-only transcript.
+            raise RuntimeError("No usable speech could be transcribed from the recording.")
 
         combined = "\n\n".join(parts)
         logger.info(
