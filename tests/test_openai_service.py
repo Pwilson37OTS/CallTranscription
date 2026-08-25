@@ -1,6 +1,14 @@
 from unittest.mock import patch, MagicMock
 
-from openai_service import transcribe_audio, diarize_transcript, _looks_repetitive
+import pytest
+
+from openai_service import (
+    transcribe_audio,
+    diarize_transcript,
+    _looks_repetitive,
+    _is_thin_transcript,
+    _fallback_model_for,
+)
 
 
 # A looped transcription: one block repeated many times (the real failure mode).
@@ -43,9 +51,28 @@ class TestRepetitionDetection:
         assert _looks_repetitive(text) is False
 
 
+class TestTranscribeHelpers:
+    def test_fallback_model_alternates(self):
+        assert _fallback_model_for("gpt-4o-transcribe") == "whisper-1"
+        assert _fallback_model_for("whisper-1") == "gpt-4o-transcribe"
+
+    def test_thin_transcript_flagged(self):
+        # ~8 words over 37 minutes = the hallucination case → far below 20 wpm.
+        assert _is_thin_transcript("Hello bonsoir a tous eight nine ten store", 37 * 60) is True
+
+    def test_normal_density_not_thin(self):
+        text = " ".join(["word"] * 300)  # 300 words over 5 min = 60 wpm
+        assert _is_thin_transcript(text, 5 * 60) is False
+
+    def test_thin_check_skipped_for_short_or_unknown_duration(self):
+        assert _is_thin_transcript("hi", 30) is False       # under 60s
+        assert _is_thin_transcript("hi", None) is False      # duration unknown
+
+
 class TestTranscribeAudio:
+    @patch("file_service.get_audio_duration_seconds", return_value=30.0)
     @patch("openai_service.get_openai_client")
-    def test_calls_openai_and_returns_text(self, mock_get_client, tmp_path):
+    def test_calls_openai_and_returns_text(self, mock_get_client, mock_dur, tmp_path):
         audio_file = tmp_path / "test.wav"
         audio_file.write_bytes(b"fake audio data")
 
@@ -60,8 +87,9 @@ class TestTranscribeAudio:
         assert result == "This is the transcribed text."
         mock_client.audio.transcriptions.create.assert_called_once()
 
+    @patch("file_service.get_audio_duration_seconds", return_value=30.0)
     @patch("openai_service.get_openai_client")
-    def test_retries_with_fallback_when_repetitive(self, mock_get_client, tmp_path):
+    def test_retries_with_fallback_when_repetitive(self, mock_get_client, mock_dur, tmp_path):
         audio_file = tmp_path / "loop.wav"
         audio_file.write_bytes(b"fake audio data")
 
@@ -76,9 +104,60 @@ class TestTranscribeAudio:
 
         assert result == "A clean short transcript of the call about the role."
         assert mock_client.audio.transcriptions.create.call_count == 2
-        # Fallback call used whisper-1.
-        second_call = mock_client.audio.transcriptions.create.call_args_list[1]
-        assert second_call.kwargs["model"] == "whisper-1"
+        # gpt-4o-transcribe failed → fallback uses the OTHER model, whisper-1.
+        assert mock_client.audio.transcriptions.create.call_args_list[1].kwargs["model"] == "whisper-1"
+
+    @patch("file_service.get_audio_duration_seconds", return_value=120.0)
+    @patch("openai_service.get_openai_client")
+    def test_retries_with_fallback_when_thin(self, mock_get_client, mock_dur, tmp_path):
+        # Hallucination case: a few words for 2 minutes of audio → thin → retry.
+        audio_file = tmp_path / "thin.wav"
+        audio_file.write_bytes(b"fake audio data")
+
+        thin = MagicMock(); thin.text = "Hello. Bonsoir a tous. Das ist gut."
+        good = MagicMock(); good.text = " ".join(["word"] * 400)
+        mock_client = MagicMock()
+        mock_client.audio.transcriptions.create.side_effect = [thin, good]
+        mock_get_client.return_value = mock_client
+
+        result = transcribe_audio(str(audio_file), model="whisper-1")
+
+        assert result == good.text
+        assert mock_client.audio.transcriptions.create.call_count == 2
+        # whisper-1 failed → fallback uses the OTHER model, gpt-4o-transcribe.
+        assert mock_client.audio.transcriptions.create.call_args_list[1].kwargs["model"] == "gpt-4o-transcribe"
+
+    @patch("file_service.split_audio_for_transcription")
+    @patch("file_service.get_audio_duration_seconds", return_value=2000.0)  # forces chunking
+    @patch("openai_service._transcribe_segment")
+    def test_chunk_failure_leaves_gap_marker(self, mock_seg, mock_dur, mock_split, tmp_path):
+        audio_file = tmp_path / "long.wav"
+        audio_file.write_bytes(b"fake audio data")
+        cdir = tmp_path / "long_chunks"; cdir.mkdir()
+        c0 = cdir / "chunk_000.mp3"; c0.write_bytes(b"a")
+        c1 = cdir / "chunk_001.mp3"; c1.write_bytes(b"b")
+        mock_split.return_value = [c0, c1]
+        # First chunk transcribes; second fails permanently (both models errored).
+        mock_seg.side_effect = ["Real transcript for the first segment.", Exception("boom")]
+
+        result = transcribe_audio(str(audio_file), model="whisper-1")
+
+        assert "Real transcript for the first segment." in result
+        assert "[Transcription unavailable for audio segment 2 of 2]" in result
+
+    @patch("file_service.split_audio_for_transcription")
+    @patch("file_service.get_audio_duration_seconds", return_value=2000.0)
+    @patch("openai_service._transcribe_segment")
+    def test_all_chunks_failing_raises(self, mock_seg, mock_dur, mock_split, tmp_path):
+        audio_file = tmp_path / "bad.wav"
+        audio_file.write_bytes(b"fake audio data")
+        cdir = tmp_path / "bad_chunks"; cdir.mkdir()
+        c0 = cdir / "chunk_000.mp3"; c0.write_bytes(b"a")
+        mock_split.return_value = [c0]
+        mock_seg.side_effect = [Exception("boom")]
+
+        with pytest.raises(RuntimeError, match="every audio segment"):
+            transcribe_audio(str(audio_file), model="whisper-1")
 
 
 class TestDiarizeTranscript:

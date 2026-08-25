@@ -31,8 +31,21 @@ _TRANSCRIBE_DIRECT_LIMIT_BYTES = 24 * 1024 * 1024
 _TRANSCRIBE_CHUNK_THRESHOLD_SECONDS = 360   # 6 minutes
 _TRANSCRIBE_CHUNK_SECONDS = 300             # 5-minute segments
 
-# Fallback model used to re-transcribe a segment that came back repetitive.
-_TRANSCRIBE_FALLBACK_MODEL = "whisper-1"
+# The two transcription models we alternate between on failure. When one
+# produces a bad result we retry with the *other* — retrying the same model
+# rarely helps, and the two fail on different inputs.
+_TRANSCRIBE_MODELS = ("gpt-4o-transcribe", "whisper-1")
+
+# Below this words-per-minute, a transcript is almost certainly a failure:
+# either the model hallucinated a few random phrases on silence/noise, or it
+# returned almost nothing. Real speech runs ~120-150 wpm; even a sparse call is
+# well above 20. Only applied to segments >=60s so short clips don't false-trip.
+_MIN_WORDS_PER_MINUTE = 20
+
+
+def _fallback_model_for(model: str) -> str:
+    """Pick a transcription model different from the one that just failed."""
+    return _TRANSCRIBE_MODELS[1] if model == _TRANSCRIBE_MODELS[0] else _TRANSCRIBE_MODELS[0]
 
 
 def _transcribe_single_file(
@@ -91,34 +104,55 @@ def _looks_repetitive(text: str) -> bool:
     return False
 
 
-def _transcribe_segment(file_path: str, model: str) -> str:
-    """Transcribe one file, retrying with a fallback model if the result loops.
+def _is_thin_transcript(text: str, duration_seconds) -> bool:
+    """True if the transcript has implausibly little text for the audio length.
 
-    Returns the best available text. If the fallback also loops, the loop is
-    logged and the fallback text is returned (it's usually less corrupted than
-    the primary), so the pipeline still gets whatever was salvageable.
+    Catches the hallucination-on-silence failure: the model returns a handful of
+    random (often multilingual) phrases for many minutes of audio. Needs a known
+    duration of at least 60s to judge.
+    """
+    if not duration_seconds or duration_seconds < 60:
+        return False
+    words = len((text or "").split())
+    minutes = duration_seconds / 60.0
+    return words < minutes * _MIN_WORDS_PER_MINUTE
+
+
+def _is_bad_transcript(text: str, duration_seconds) -> bool:
+    """A transcript is bad if it loops (repetition) or is implausibly thin."""
+    return _looks_repetitive(text) or _is_thin_transcript(text, duration_seconds)
+
+
+def _transcribe_segment(file_path: str, model: str, duration_seconds=None) -> str:
+    """Transcribe one file, retrying with the *other* model if the result is bad.
+
+    "Bad" = a repetition loop or implausibly thin output (hallucination on
+    silence). Returns the best available text; if both models produce bad output
+    we keep the longer of the two so the pipeline still gets what was salvageable.
     """
     text = _transcribe_single_file(file_path, model)
-    if not _looks_repetitive(text):
+    if not _is_bad_transcript(text, duration_seconds):
         return text
 
+    fallback_model = _fallback_model_for(model)
     logger.warning(
-        "Repetitive transcription detected (model=%s, file=%s); retrying with %s",
-        model, file_path, _TRANSCRIBE_FALLBACK_MODEL,
+        "Low-quality transcription (model=%s, file=%s); retrying with %s",
+        model, file_path, fallback_model,
     )
     try:
-        fallback = _transcribe_single_file(
-            file_path, _TRANSCRIBE_FALLBACK_MODEL, temperature=0.0
-        )
+        # temperature=0 stabilizes whisper-1; gpt-4o-transcribe ignores it.
+        temp = 0.0 if fallback_model == "whisper-1" else None
+        fallback = _transcribe_single_file(file_path, fallback_model, temperature=temp)
     except Exception as e:
         logger.warning("Fallback transcription failed for %s: %s", file_path, e)
         return text
 
-    if _looks_repetitive(fallback):
+    if _is_bad_transcript(fallback, duration_seconds):
         logger.warning(
-            "Fallback transcription also looked repetitive (file=%s); "
-            "using fallback text anyway", file_path,
+            "Both models produced low-quality transcription (file=%s); "
+            "keeping the longer result", file_path,
         )
+        return fallback if len(fallback or "") > len(text or "") else text
     return fallback
 
 
@@ -144,15 +178,19 @@ def transcribe_audio(file_path: str, model: str = "gpt-4o-transcribe") -> str:
         f"{duration:.0f}s" if duration else "unknown",
     )
 
-    # Decide whether to chunk. Prefer duration; fall back to file size when
-    # ffprobe isn't available (short calls stay a single request).
-    if duration is not None:
-        needs_chunking = duration > _TRANSCRIBE_CHUNK_THRESHOLD_SECONDS
-    else:
-        needs_chunking = size_bytes > _TRANSCRIBE_DIRECT_LIMIT_BYTES
+    # Decide whether to chunk. Chunk when the call is long, when it's over the
+    # single-request size limit, OR when the duration is unknown — an unknown
+    # duration means ffprobe couldn't read the file, so we can't assume it's
+    # short, and a long call sent as one request is a known hallucination
+    # trigger. Chunking a genuinely short file just yields a single segment.
+    needs_chunking = (
+        duration is None
+        or duration > _TRANSCRIBE_CHUNK_THRESHOLD_SECONDS
+        or size_bytes > _TRANSCRIBE_DIRECT_LIMIT_BYTES
+    )
 
     if not needs_chunking:
-        text = _transcribe_segment(file_path, model)
+        text = _transcribe_segment(file_path, model, duration_seconds=duration)
         logger.info("Transcription complete: model=%s chars=%d", model, len(text))
         return text
 
@@ -163,18 +201,34 @@ def transcribe_audio(file_path: str, model: str = "gpt-4o-transcribe") -> str:
     chunks_dir = chunks[0].parent
     try:
         parts = []
+        real_parts = 0  # chunks that produced actual transcript text (not a gap marker)
         for i, chunk_path in enumerate(chunks, start=1):
             logger.info(
                 "Transcribing chunk %d/%d: %s (%.1f MB)",
                 i, len(chunks), chunk_path.name,
                 chunk_path.stat().st_size / (1024 * 1024),
             )
-            parts.append(_transcribe_segment(str(chunk_path), model))
+            chunk_duration = get_audio_duration_seconds(chunk_path)
+            try:
+                parts.append(_transcribe_segment(str(chunk_path), model, duration_seconds=chunk_duration))
+                real_parts += 1
+            except Exception as e:
+                # One chunk failing (both models errored) must not throw away the
+                # whole call — leave a labeled gap and keep the other segments.
+                logger.error(
+                    "Chunk %d/%d failed permanently: %s", i, len(chunks), e
+                )
+                parts.append(f"[Transcription unavailable for audio segment {i} of {len(chunks)}]")
+
+        if real_parts == 0:
+            # Nothing transcribed at all — surface as an error (retryable) rather
+            # than storing a transcript that's only gap markers.
+            raise RuntimeError("Transcription failed for every audio segment.")
 
         combined = "\n\n".join(parts)
         logger.info(
-            "Transcription complete (chunked): chunks=%d total_chars=%d",
-            len(chunks), len(combined),
+            "Transcription complete (chunked): chunks=%d ok=%d total_chars=%d",
+            len(chunks), real_parts, len(combined),
         )
         return combined
     finally:
