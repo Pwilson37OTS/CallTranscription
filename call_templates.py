@@ -119,4 +119,33 @@ OOPS Section
 • List any questions or items from the previous sections that the recruiter forgot to cover with the candidate.
 """,
     },
+    "reference_check": {
+        "label": "Reference Check",
+        # On a reference check the person on the call is a professional
+        # REFERENCE speaking about the candidate — not the candidate. This tells
+        # analyze_call to label/frame the note accordingly.
+        "subject_role": "reference",
+        "template": """\
+Reference Check
+the recruiter should ask (list the question within the response):
+• At what company did you work together?
+• What was your title at that company?
+• Do you know their estimated dates of employment?
+• How did they work with you? (Were you their supervisor, a peer, etc.?)
+• If you were a supervisor, did they work directly under you?
+• What were their job responsibilities?
+• How is their personality within the work environment?
+• Were there ever any issues?
+• How was their time and attendance?
+• Do they present themselves professionally?
+• Where do you feel they could stand to improve?
+• To your knowledge, what was their reason for leaving?
+• Would you want to work with them again?
+• Would they be eligible for rehire?
+• On a scale of 1 to 10 (10 being the highest), how would you rank them overall?
+
+OOPS Section
+• List any questions from the Reference Check section that the recruiter forgot to ask the reference.
+""",
+    },
 }

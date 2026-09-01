@@ -385,33 +385,52 @@ def analyze_call(
     metadata: Dict[str, Any],
     model: str = "gpt-4.1",
     technical_questions: str = "",
+    subject_role: str = "candidate",
 ) -> str:
-    """Produce a candidate information note from the call transcript.
+    """Produce an information note from the call transcript.
 
-    The output is a structured note about the candidate, organized by the
-    sections in the template. Each question is followed by the candidate's
-    response (summarized for readability, comprehensive for technical
-    screening questions). It's a record FOR the candidate's file, not a
-    recruiter coaching evaluation.
+    The output is a structured note organized by the sections in the template.
+    Each question is followed by the answer given on the call, in prose. It's a
+    record for the ATS, not a recruiter coaching evaluation.
+
+    subject_role: "candidate" (default) for screening/interview calls where the
+    person on the call is the candidate; "reference" for reference-check calls
+    where the person on the call is a professional reference speaking ABOUT the
+    candidate.
     """
     logger.info(
-        "Call analysis started: model=%s call_type=%s chars=%d",
-        model, call_type_label, len(transcript_text),
+        "Call analysis started: model=%s call_type=%s subject_role=%s chars=%d",
+        model, call_type_label, subject_role, len(transcript_text),
     )
 
     recruiter = (metadata.get("recruiter_name") or "").strip() or "the recruiter"
     subject = (metadata.get("subject_name") or "").strip() or "the contact"
     call_timestamp = (metadata.get("call_timestamp") or "").strip()
 
-    system_prompt = (
-        "You are a recruiting assistant for OakTree Staffing. The user will "
-        "give you a transcript of a recruiter screening call plus an "
-        "evaluation template listing the questions and topics the recruiter "
-        "should have covered. Your job is to produce a clean, structured "
-        "candidate information note suitable for pasting into the candidate's "
-        "record in the ATS (Bullhorn). This is an informational document "
-        "ABOUT THE CANDIDATE — not a recruiter performance review."
-    )
+    is_reference = (subject_role or "candidate").strip().lower() == "reference"
+    # Used as "the {answerer}'s response" throughout the section instructions.
+    answerer = "reference" if is_reference else "candidate"
+
+    if is_reference:
+        system_prompt = (
+            "You are a recruiting assistant for OakTree Staffing. The user will "
+            "give you a transcript of a REFERENCE CHECK call plus an evaluation "
+            "template listing the questions the recruiter should have asked. The "
+            "person on the call is a professional REFERENCE speaking about a "
+            "candidate — NOT the candidate themselves. Produce a clean, structured "
+            "note recording the reference's answers about the candidate, suitable "
+            "for pasting into the candidate's record in the ATS (Bullhorn)."
+        )
+    else:
+        system_prompt = (
+            "You are a recruiting assistant for OakTree Staffing. The user will "
+            "give you a transcript of a recruiter screening call plus an "
+            "evaluation template listing the questions and topics the recruiter "
+            "should have covered. Your job is to produce a clean, structured "
+            "candidate information note suitable for pasting into the candidate's "
+            "record in the ATS (Bullhorn). This is an informational document "
+            "ABOUT THE CANDIDATE — not a recruiter performance review."
+        )
 
     tech_block = ""
     if technical_questions and technical_questions.strip():
@@ -427,10 +446,25 @@ def analyze_call(
             "----------\n\n"
         )
 
+    participant_line = (
+        f"Reference (on the call, speaking about the candidate): {subject}\n"
+        if is_reference else f"Candidate: {subject}\n"
+    )
+    header_block = (
+        f"# Reference Check\n"
+        f"**Reference:** {subject}\n"
+        f"**Recruiter:** {recruiter}\n"
+        f"**Date:** {call_timestamp or 'unknown'}\n\n"
+        if is_reference else
+        f"# Interview with {subject}\n"
+        f"**Recruiter:** {recruiter}\n"
+        f"**Date:** {call_timestamp or 'unknown'}\n\n"
+    )
+
     user_prompt = (
         f"Call Type: {call_type_label}\n"
         f"Recruiter: {recruiter}\n"
-        f"Candidate: {subject}\n"
+        f"{participant_line}"
         f"Call Date/Time: {call_timestamp or 'unknown'}\n\n"
 
         "EVALUATION TEMPLATE:\n"
@@ -448,20 +482,18 @@ def analyze_call(
         "Produce a candidate information note in markdown following this format.\n\n"
 
         "HEADER (top of the note):\n"
-        f"# Interview with {subject}\n"
-        f"**Recruiter:** {recruiter}\n"
-        f"**Date:** {call_timestamp or 'unknown'}\n\n"
+        f"{header_block}"
 
         "SECTIONS — for each section of the EVALUATION TEMPLATE above:\n"
         "1. Use the template's section name verbatim as a `## section heading`.\n"
         "2. For each question/topic in the section, output a bullet that begins "
-        "with the question text, then the candidate's response in clean, "
+        f"with the question text, then the {answerer}'s response in clean, "
         "factual prose based on what they actually said in the transcript.\n"
         "3. Write the response as informative prose — NOT verbatim quotes in "
         "quotation marks. Capture every specific fact: names, numbers, dates, "
         "locations, dollar amounts, durations, company names, technologies. "
         "Use semicolons to separate distinct facts in a single bullet when needed.\n"
-        "4. If a question was not asked, OR the candidate did not give a "
+        f"4. If a question was not asked, OR the {answerer} did not give a "
         "substantive answer, write `Not discussed.` after the bullet.\n"
         "5. Do NOT include 'Covered' / 'Partially Covered' / 'Missed' labels. "
         "This is a candidate information document, not a coaching report.\n"

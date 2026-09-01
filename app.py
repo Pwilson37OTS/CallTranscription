@@ -551,27 +551,38 @@ with calls_tab:
                     current_user_id, call["id"], e,
                 )
 
-            # === Step 3: Technical Screening Questions + Analyze Call ===
-            tq_col, btn_col = st.columns([4, 1])
-            with tq_col:
-                tech_questions_key = f"tech_questions_{call['id']}"
-                tech_questions = st.text_area(
-                    "Place Technical Screening Questions Here",
-                    height=140,
-                    key=tech_questions_key,
-                    placeholder=(
-                        "One per line. The analysis will verify whether each "
-                        "was asked and capture the candidate's verbatim response."
-                    ),
-                )
-            with btn_col:
-                st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+            # === Step 3: (Technical Screening Questions +) Analyze Call ===
+            # The tech-questions box only applies to call types whose template
+            # has a "Technical Screening Questions" section (the Screening Call).
+            _show_tech = "Technical Screening Questions" in CALL_TEMPLATES[selected_call_type]["template"]
+            tech_questions = ""
+            if _show_tech:
+                tq_col, btn_col = st.columns([4, 1])
+                with tq_col:
+                    tech_questions = st.text_area(
+                        "Place Technical Screening Questions Here",
+                        height=140,
+                        key=f"tech_questions_{call['id']}",
+                        placeholder=(
+                            "One per line. The analysis will verify whether each "
+                            "was asked and capture the candidate's verbatim response."
+                        ),
+                    )
+                with btn_col:
+                    st.markdown("<div style='height: 28px'></div>", unsafe_allow_html=True)
+                    analyze_clicked = st.button(
+                        "Analyze Call",
+                        key=f"analyze_{call['id']}",
+                        use_container_width=True,
+                        disabled=not call["transcript_text"],
+                        help="Run the evaluation against the transcript.",
+                    )
+            else:
                 analyze_clicked = st.button(
                     "Analyze Call",
                     key=f"analyze_{call['id']}",
-                    use_container_width=True,
                     disabled=not call["transcript_text"],
-                    help="Run the coaching evaluation against the transcript.",
+                    help="Run the evaluation against the transcript.",
                 )
 
             # Analyze action — runs before the analysis section renders below.
@@ -610,6 +621,7 @@ with calls_tab:
                                 },
                                 model=DEFAULT_DIARIZATION_MODEL,
                                 technical_questions=tech_questions or "",
+                                subject_role=template_cfg.get("subject_role", "candidate"),
                             )
                         stored_analysis = (
                             f"_Analyzed as: **{template_cfg['label']}**_\n\n{analysis_text}"

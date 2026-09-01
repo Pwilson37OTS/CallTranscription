@@ -5,10 +5,72 @@ import pytest
 from openai_service import (
     transcribe_audio,
     diarize_transcript,
+    analyze_call,
     _looks_repetitive,
     _is_thin_transcript,
     _fallback_model_for,
 )
+
+
+def _captured_prompts(mock_client):
+    msgs = mock_client.chat.completions.create.call_args.kwargs["messages"]
+    system = next(m["content"] for m in msgs if m["role"] == "system")
+    user = next(m["content"] for m in msgs if m["role"] == "user")
+    return system, user
+
+
+def _analyze_mock():
+    mock_client = MagicMock()
+    choice = MagicMock(); choice.message.content = "note"
+    resp = MagicMock(); resp.choices = [choice]
+    mock_client.chat.completions.create.return_value = resp
+    return mock_client
+
+
+class TestAnalyzeCall:
+    def test_reference_check_template_present(self):
+        from call_templates import CALL_TEMPLATES
+        t = CALL_TEMPLATES["reference_check"]
+        assert t["label"] == "Reference Check"
+        assert t["subject_role"] == "reference"
+        assert "eligible for rehire" in t["template"]
+        # No technical section → the tech-questions box stays hidden for it.
+        assert "Technical Screening Questions" not in t["template"]
+
+    @patch("openai_service.get_openai_client")
+    def test_reference_framing(self, mock_get_client):
+        mock_client = _analyze_mock()
+        mock_get_client.return_value = mock_client
+        analyze_call(
+            transcript_text="...",
+            call_type_label="Reference Check",
+            template="Reference Check\n• Would they be eligible for rehire?",
+            metadata={"recruiter_name": "Matt", "subject_name": "Jane Doe",
+                      "call_timestamp": "2026-08-25"},
+            subject_role="reference",
+        )
+        system, user = _captured_prompts(mock_client)
+        assert "REFERENCE" in system.upper()
+        assert "Reference (on the call" in user
+        assert "# Reference Check" in user
+        assert "Interview with" not in user  # not mislabeled as a candidate interview
+
+    @patch("openai_service.get_openai_client")
+    def test_candidate_framing_is_default_and_unchanged(self, mock_get_client):
+        mock_client = _analyze_mock()
+        mock_get_client.return_value = mock_client
+        analyze_call(
+            transcript_text="...",
+            call_type_label="Screening Call",
+            template="Work Status\n• U.S. work status?",
+            metadata={"recruiter_name": "Matt", "subject_name": "John",
+                      "call_timestamp": "2026-08-25"},
+            # subject_role defaults to "candidate"
+        )
+        system, user = _captured_prompts(mock_client)
+        assert "ABOUT THE CANDIDATE" in system
+        assert "# Interview with John" in user
+        assert "Candidate: John" in user
 
 
 # A looped transcription: one block repeated many times (the real failure mode).
